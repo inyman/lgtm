@@ -1,0 +1,15 @@
+{
+  "defaultModel": "deepseek/deepseek-v4-pro-0813",
+  "defaultProvider": "openrouter",
+  "skills": [
+  ],
+  "enabledModels": [
+    "openrouter/deepseek/deepseek-v4-pro-0813",
+    "openrouter/~deepseek/deepseek-v4-flash-latest",
+    "openrouter/moonshotai/kimi-k3",
+    "openrouter/moonshotai/kimi-k2.7-code",
+    "openrouter/z-ai/glm-5.2",
+    "openrouter/qwen/qwen3.8-2.4t-a95b"
+  ]
+}
+

@@ -135,11 +135,6 @@ pub fn token_style(token: Token) -> HighlightStyle {
     }
 }
 
-/// Dimming layer behind the command palette.
-pub fn palette_backdrop() -> Rgba {
-    rgba(0x11111baa)
-}
-
 /// Split view: background for the absent side of a one-sided row — darker
 /// than any content row so it clearly reads as "nothing here".
 pub fn void_cell_bg() -> Rgba {
@@ -150,21 +145,6 @@ pub fn void_cell_bg() -> Rgba {
 /// gpui-component theme as `selection` in `apply_ui_theme`.
 pub fn selection_bg() -> Rgba {
     rgba(0x89b4fa4d)
-}
-
-/// Review comment card: a blue tint that lifts the thread off the diff without
-/// hiding it, with a stronger wash behind each comment's author line.
-pub fn comment_bg() -> Rgba {
-    rgba(0x89b4fa14)
-}
-pub fn comment_header_bg() -> Rgba {
-    rgba(0x89b4fa2b)
-}
-
-/// Outline drawn around a whole thread: sky at partial alpha, so it reads as a
-/// soft neon edge against the dark pane without competing with the diff.
-pub fn comment_outline() -> Rgba {
-    rgba(0x89dceb8c)
 }
 
 /// Low-alpha tints: syntax/text must stay readable on top. Never opaque.

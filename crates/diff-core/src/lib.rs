@@ -311,7 +311,10 @@ fn parse_git_paths(rest: &str) -> (Option<String>, Option<String>) {
             return (strip_side(parts[0]), strip_side(parts[1]));
         }
     }
-    if let Some(pos) = rest.find(" b/") {
+    // Unquoted form: "<old> <new>", each side carrying a git diff prefix
+    // (a/ b/ c/ w/ 1/ 2/) or /dev/null. Git quotes any path that contains
+    // a space, so the first space is the separator.
+    if let Some(pos) = rest.find(' ') {
         let old = strip_side(&rest[..pos]);
         let new = strip_side(&rest[pos + 1..]);
         return (old, new);
@@ -320,9 +323,14 @@ fn parse_git_paths(rest: &str) -> (Option<String>, Option<String>) {
 }
 
 fn strip_side(path: &str) -> Option<String> {
-    path.strip_prefix("a/")
-        .or_else(|| path.strip_prefix("b/"))
-        .map(str::to_string)
+    // git ≥ 2.54 uses c/ (old commit) / w/ (worktree) for tracked files
+    // and 1/ / 2/ for --no-index; earlier versions use a/ / b/.
+    for prefix in &["a/", "b/", "c/", "w/", "1/", "2/"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            return Some(rest.to_string());
+        }
+    }
+    None
 }
 
 /// Path from a `---`/`+++` marker: `a/path`, `b/path`, `/dev/null`, maybe quoted.
