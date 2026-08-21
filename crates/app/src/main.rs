@@ -3,14 +3,14 @@
 //! Open it inside a repository (or pass a path) and it shows everything that
 //! changed since the diff base: committed, staged, unstaged, and untracked —
 //! as one reviewable diff with syntax highlighting, word-level intra-line
-//! diffs, unified/split views, a file tree, and a minimap.
+//! diffs, unified/split views, and a file tree.
 
 mod theme;
 
 use diff_core::{DiffRow, FileDiff, FileStatus, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, size, uniform_list, App,
+    actions, div, font, point, prelude::*, px, size, uniform_list, App,
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString, StyledText, Subscription,
@@ -23,14 +23,12 @@ use gpui_component::{
     tag::Tag,
     Root, Sizable as _, TitleBar,
 };
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const MONO: &str = "Menlo";
+const MONO: &str = "JetBrainsMono Nerd Font";
 
 /// Diff pane font size in px, adjustable at runtime (cmd-+ / cmd-- / cmd-0).
 static FONT_PX: AtomicU32 = AtomicU32::new(DEFAULT_TEXT_SIZE as u32);
@@ -73,10 +71,10 @@ actions!(
         ClearSelection,
         CopySelection,
         FocusTreeFilter,
-        ToggleMinimap,
         ZoomIn,
         ZoomOut,
-        ZoomReset
+        ZoomReset,
+        ToggleKeybindings,
     ]
 );
 
@@ -201,6 +199,30 @@ fn hunk_syntax(
 /// Flatten the diff into display rows plus the row indices of file headers and
 /// hunk headers. Split mode pairs removed/added runs positionally into
 /// two-cell rows; unequal runs leave one-sided rows.
+/// Index and char count of the longest line across the display rows. The
+/// index is used to tell the uniform list which row to measure for horizontal
+/// scrolling; the char count sizes split-mode columns.
+fn widest_line(rows: &[Row]) -> (usize, usize) {
+    let mut best_ix = 0;
+    let mut best_chars = 0;
+    for (ix, row) in rows.iter().enumerate() {
+        let chars = match row {
+            Row::Line { text, .. } => text.chars().count(),
+            Row::SplitLine { left, right } => {
+                let l = left.as_ref().map(|c| c.text.chars().count()).unwrap_or(0);
+                let r = right.as_ref().map(|c| c.text.chars().count()).unwrap_or(0);
+                l.max(r)
+            }
+            _ => 0,
+        };
+        if chars > best_chars {
+            best_chars = chars;
+            best_ix = ix;
+        }
+    }
+    (best_ix, best_chars)
+}
+
 fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut file_rows = Vec::new();
@@ -487,7 +509,7 @@ fn line_content(
     }
 }
 
-fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>) -> gpui::AnyElement {
+fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>, cell_width: Pixels) -> gpui::AnyElement {
     let row_height = px(row_height());
     match row {
         Row::Spacer => div().h(row_height).into_any_element(),
@@ -610,8 +632,8 @@ fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>) -> gpui::An
             };
             let cell = |cell: &Option<Cell>, sel: Option<Range<usize>>| {
                 let base = div()
-                    .flex_1()
-                    .min_w_0()
+                    .w(cell_width)
+                    .flex_shrink_0()
                     .overflow_hidden()
                     .h_full()
                     .flex()
@@ -652,7 +674,6 @@ fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>) -> gpui::An
             };
             div()
                 .h(row_height)
-                .w_full()
                 .flex()
                 .child(cell(left, left_sel))
                 .child(
@@ -668,213 +689,6 @@ fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>) -> gpui::An
                 .child(cell(right, right_sel))
                 .into_any_element()
         }
-    }
-}
-
-// --- Minimap ---------------------------------------------------------------
-
-const MINIMAP_WIDTH: f32 = 100.0;
-const MINIMAP_PAD: f32 = 4.0;
-const MINIMAP_GAP: f32 = 2.0;
-const MAX_MINIMAP_CHARS: usize = 160;
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-struct MinimapRow {
-    kind: MinimapKind,
-    len_frac: f32,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum MinimapKind {
-    Context,
-    Added,
-    Removed,
-    SplitPair {
-        left_frac: f32,
-        right_frac: f32,
-        left: bool,
-        right: bool,
-    },
-    Header,
-    Blank,
-}
-
-fn line_frac(text: &str) -> f32 {
-    text.chars().take(MAX_MINIMAP_CHARS).count() as f32 / MAX_MINIMAP_CHARS as f32
-}
-
-fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
-    rows.iter()
-        .map(|row| match row {
-            Row::Spacer | Row::Binary => MinimapRow {
-                kind: MinimapKind::Blank,
-                len_frac: 0.,
-            },
-            Row::FileHeader { .. } | Row::HunkHeader { .. } => MinimapRow {
-                kind: MinimapKind::Header,
-                len_frac: 1.,
-            },
-            Row::Line { kind, text, .. } => MinimapRow {
-                kind: match kind {
-                    LineKind::Context => MinimapKind::Context,
-                    LineKind::Added => MinimapKind::Added,
-                    LineKind::Removed => MinimapKind::Removed,
-                },
-                len_frac: line_frac(text),
-            },
-            Row::SplitLine { left, right } => {
-                let frac =
-                    |cell: &Option<Cell>| cell.as_ref().map(|c| line_frac(&c.text)).unwrap_or(0.);
-                let (left_frac, right_frac) = (frac(left), frac(right));
-                MinimapRow {
-                    kind: MinimapKind::SplitPair {
-                        left_frac,
-                        right_frac,
-                        left: matches!(left, Some(c) if c.kind == LineKind::Removed),
-                        right: matches!(right, Some(c) if c.kind == LineKind::Added),
-                    },
-                    len_frac: left_frac.max(right_frac),
-                }
-            }
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MinimapLane {
-    Full,
-    Left,
-    Right,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MinimapColor {
-    Added,
-    Removed,
-    Context,
-    Header,
-}
-
-fn minimap_priority(color: MinimapColor) -> u8 {
-    match color {
-        MinimapColor::Removed => 5,
-        MinimapColor::Added => 4,
-        MinimapColor::Header => 3,
-        MinimapColor::Context => 1,
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-struct MinimapRun {
-    start: u32,
-    end: u32,
-    lane: MinimapLane,
-    color: MinimapColor,
-    frac: f32,
-    tick: bool,
-}
-
-struct MinimapLayout {
-    slot_h: f32,
-    group: usize,
-    runs: Vec<MinimapRun>,
-}
-
-fn minimap_scale(total: usize, pane_px: f32) -> (f32, usize) {
-    if total == 0 || pane_px <= 0. {
-        return (1., 1);
-    }
-    if total as f32 > pane_px {
-        (1., (total as f32 / pane_px).ceil() as usize)
-    } else {
-        ((pane_px / total as f32).clamp(1., 3.), 1)
-    }
-}
-
-fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
-    let (slot_h, group) = minimap_scale(rows.len(), pane_px);
-    let mut runs: Vec<MinimapRun> = Vec::new();
-    let mut open: [Option<usize>; 3] = [None; 3];
-    for (slot, chunk) in rows.chunks(group).enumerate() {
-        let mut winner: [Option<MinimapColor>; 3] = [None; 3];
-        let mut frac: [f32; 3] = [0.; 3];
-        for row in chunk {
-            let mut fold = |lane: MinimapLane, color: MinimapColor, f: f32| {
-                let ix = lane as usize;
-                if winner[ix].map_or(true, |best| {
-                    minimap_priority(color) > minimap_priority(best)
-                }) {
-                    winner[ix] = Some(color);
-                }
-                frac[ix] = frac[ix].max(f);
-            };
-            match row.kind {
-                MinimapKind::Blank => {}
-                MinimapKind::Header => fold(MinimapLane::Full, MinimapColor::Header, 1.),
-                MinimapKind::Context => {
-                    fold(MinimapLane::Full, MinimapColor::Context, row.len_frac)
-                }
-                MinimapKind::Added => fold(MinimapLane::Full, MinimapColor::Added, row.len_frac),
-                MinimapKind::Removed => {
-                    fold(MinimapLane::Full, MinimapColor::Removed, row.len_frac)
-                }
-                MinimapKind::SplitPair {
-                    left_frac,
-                    right_frac,
-                    left,
-                    right,
-                } => {
-                    if left_frac > 0. || left {
-                        let color = if left {
-                            MinimapColor::Removed
-                        } else {
-                            MinimapColor::Context
-                        };
-                        fold(MinimapLane::Left, color, left_frac);
-                    }
-                    if right_frac > 0. || right {
-                        let color = if right {
-                            MinimapColor::Added
-                        } else {
-                            MinimapColor::Context
-                        };
-                        fold(MinimapLane::Right, color, right_frac);
-                    }
-                }
-            }
-        }
-        for ix in 0..3 {
-            let (Some(color), f) = (winner[ix], frac[ix]) else {
-                open[ix] = None;
-                continue;
-            };
-            if f <= 0. {
-                open[ix] = None;
-                continue;
-            }
-            let tick = matches!(color, MinimapColor::Header) && slot_h > 1.;
-            if let Some(run_ix) = open[ix] {
-                let run = &mut runs[run_ix];
-                if !tick && !run.tick && run.color == color && run.frac == f {
-                    run.end += 1;
-                    continue;
-                }
-            }
-            open[ix] = (!tick).then_some(runs.len());
-            runs.push(MinimapRun {
-                start: slot as u32,
-                end: slot as u32 + 1,
-                lane: [MinimapLane::Full, MinimapLane::Left, MinimapLane::Right][ix],
-                color,
-                frac: f,
-                tick,
-            });
-        }
-    }
-    MinimapLayout {
-        slot_h,
-        group,
-        runs,
     }
 }
 
@@ -1199,8 +1013,8 @@ struct ItemData {
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
-    minimap: Vec<MinimapRow>,
-    minimap_cache: RefCell<Option<(f32, Rc<MinimapLayout>)>>,
+    max_line_chars: usize,
+    widest_row_ix: usize,
     cursor: usize,
     scroll: UniformListScrollHandle,
     additions: u32,
@@ -1214,23 +1028,12 @@ struct ItemData {
 
 impl ItemData {
     fn set_rows(&mut self, (rows, file_rows, hunk_rows): (Vec<Row>, Vec<usize>, Vec<usize>)) {
-        self.minimap = minimap_rows(&rows);
-        self.minimap_cache.replace(None);
+        let (widest_row_ix, max_line_chars) = widest_line(&rows);
+        self.widest_row_ix = widest_row_ix;
+        self.max_line_chars = max_line_chars;
         self.rows = rows;
         self.file_rows = file_rows;
         self.hunk_rows = hunk_rows;
-    }
-
-    fn minimap_layout(&self, pane_px: f32) -> Rc<MinimapLayout> {
-        let mut cache = self.minimap_cache.borrow_mut();
-        if let Some((h, layout)) = &*cache {
-            if *h == pane_px {
-                return layout.clone();
-            }
-        }
-        let layout = Rc::new(minimap_runs(&self.minimap, pane_px));
-        *cache = Some((pane_px, layout.clone()));
-        layout
     }
 
     fn rebuild_tree(&mut self) {
@@ -1271,12 +1074,6 @@ fn fetch_item(path: &Path, mode: ViewMode) -> anyhow::Result<Loaded> {
 
 // --- Titlebar ------------------------------------------------------------
 
-fn dir_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
 fn centered_message(text: SharedString, color: gpui::Rgba) -> gpui::AnyElement {
     div()
         .size_full()
@@ -1289,17 +1086,7 @@ fn centered_message(text: SharedString, color: gpui::Rgba) -> gpui::AnyElement {
 }
 
 fn app_title(detail: Option<String>) -> gpui::AnyElement {
-    let mut title = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .flex_1()
-        .min_w_0()
-        .child(
-            div()
-                .font_weight(gpui::FontWeight::BOLD)
-                .child(SharedString::from("lgtm")),
-        );
+    let mut title = div().flex().items_center().gap_2().flex_1().min_w_0();
     if let Some(detail) = detail {
         title = title.child(
             div()
@@ -1312,56 +1099,32 @@ fn app_title(detail: Option<String>) -> gpui::AnyElement {
 }
 
 fn local_titlebar_content(src: &git::LocalSource, data: &ItemData) -> gpui::AnyElement {
-    let blue: Hsla = theme::blue().into();
     div()
         .flex()
         .items_center()
+        .gap_2()
         .flex_1()
         .min_w_0()
         .child(
             div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .min_w_0()
-                .flex_1()
-                .child(
-                    Tag::custom(blue.opacity(0.15), blue, blue.opacity(0.4))
-                        .small()
-                        .child(SharedString::from("local")),
-                )
-                .child(
-                    div()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .truncate()
-                        .child(SharedString::from(dir_name(&src.repo_root))),
-                ),
+                .text_color(theme::green())
+                .child(SharedString::from(format!("+{}", data.additions))),
         )
         .child(
             div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .flex_shrink_0()
-                .pr_3()
-                .child(
-                    div()
-                        .text_color(theme::overlay0())
-                        .child(SharedString::from(format!(
-                            "{} ← {}",
-                            src.base_label, src.branch
-                        ))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::green())
-                        .child(SharedString::from(format!("+{}", data.additions))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::red())
-                        .child(SharedString::from(format!("−{}", data.deletions))),
-                ),
+                .text_color(theme::red())
+                .child(SharedString::from(format!("−{}", data.deletions))),
+        )
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::BOLD)
+                .truncate()
+                .child(SharedString::from(src.branch.clone())),
+        )
+        .child(
+            div()
+                .text_color(theme::overlay0())
+                .child(SharedString::from(format!("vs {}", src.base_label))),
         )
         .into_any_element()
 }
@@ -1379,11 +1142,14 @@ struct ReviewApp {
     reloading: bool,
     refresh_error: Option<SharedString>,
     sidebar_visible: bool,
-    minimap_visible: bool,
+    sidebar_width: f32,
+    sidebar_resizing: bool,
+    sidebar_resize_start: Option<(f32, f32)>,
+    titlebar_dragging: bool,
+    keybindings_visible: bool,
     tree_filter_input: gpui::Entity<InputState>,
     focus_handle: FocusHandle,
     drag_anchor: Option<(SelSide, RowCol)>,
-    minimap_scrub: bool,
     char_width: Option<Pixels>,
     repo_path: PathBuf,
     _subscriptions: Vec<Subscription>,
@@ -1412,11 +1178,14 @@ impl ReviewApp {
             reloading: false,
             refresh_error: None,
             sidebar_visible: true,
-            minimap_visible: true,
+            sidebar_width: 260.,
+            sidebar_resizing: false,
+            sidebar_resize_start: None,
+            titlebar_dragging: false,
+            keybindings_visible: false,
             tree_filter_input,
             focus_handle: cx.focus_handle(),
             drag_anchor: None,
-            minimap_scrub: false,
             char_width: None,
             repo_path,
             _subscriptions,
@@ -1476,7 +1245,7 @@ impl ReviewApp {
                 data.rebuild_tree();
             }
             _ => {
-                let minimap = minimap_rows(&rows);
+                let (widest_row_ix, max_line_chars) = widest_line(&rows);
                 let mut data = Box::new(ItemData {
                     src,
                     diff,
@@ -1484,8 +1253,8 @@ impl ReviewApp {
                     rows,
                     file_rows,
                     hunk_rows,
-                    minimap,
-                    minimap_cache: RefCell::new(None),
+                    max_line_chars,
+                    widest_row_ix,
                     cursor: 0,
                     scroll: UniformListScrollHandle::new(),
                     additions,
@@ -1537,7 +1306,6 @@ impl ReviewApp {
                 .borrow()
                 .base_handle
                 .set_offset(point(offset.x, px(-(top_row * new_rh))));
-            data.minimap_cache.replace(None);
         }
         cx.notify();
     }
@@ -1550,6 +1318,20 @@ impl ReviewApp {
                 .em_advance(font_id, px(text_size()))
                 .unwrap_or(px(text_size() * 0.6))
         })
+    }
+
+    /// Width of one split-view cell: half the pane, or wide enough for the
+    /// longest line, whichever is larger — so long lines overflow into the
+    /// list's horizontal scroll rather than being clipped.
+    fn split_cell_width(&mut self, window: &Window) -> Pixels {
+        let char_w = f32::from(self.char_width(window)).max(1.);
+        let Some(data) = self.active_data() else {
+            return px(0.);
+        };
+        let pane_w = f32::from(data.scroll.0.borrow().base_handle.bounds().size.width);
+        let half = (pane_w - SPLIT_DIVIDER) / 2.;
+        let content = SPLIT_GUTTER + (data.max_line_chars as f32) * char_w;
+        px(half.max(content))
     }
 
     fn pane_hit(
@@ -1703,124 +1485,7 @@ impl ReviewApp {
         }
     }
 
-    fn minimap_scrub_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(data) = self.active_data() else {
-            return;
-        };
-        let total = data.rows.len();
-        if total == 0 {
-            return;
-        }
-        let (bounds, offset) = {
-            let state = data.scroll.0.borrow();
-            (state.base_handle.bounds(), state.base_handle.offset())
-        };
-        let pane_h = f32::from(bounds.size.height);
-        if pane_h <= 0. {
-            return;
-        }
-        let (slot_h, group) = minimap_scale(total, pane_h);
-        let px_per_row = slot_h / group as f32;
-        let y = f32::from(position.y - bounds.top());
-        let row = (y / px_per_row).clamp(0., (total - 1) as f32);
-        let target = row * row_height() - (pane_h - row_height()) / 2.;
-        let max_scroll = (total as f32 * row_height() - pane_h).max(0.);
-        data.scroll
-            .0
-            .borrow()
-            .base_handle
-            .set_offset(point(offset.x, px(-target.clamp(0., max_scroll))));
-        cx.notify();
-    }
-
-    fn render_minimap(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let entity = cx.entity();
-        div()
-            .w(px(MINIMAP_WIDTH))
-            .h_full()
-            .flex_shrink_0()
-            .bg(Hsla::from(theme::crust()).opacity(0.5))
-            .border_l_1()
-            .border_color(theme::surface0())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    window.focus(&this.focus_handle);
-                    this.minimap_scrub = true;
-                    this.minimap_scrub_to(event.position, cx);
-                }),
-            )
-            .child(
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, cx| {
-                        let this = entity.read(cx);
-                        let Some(data) = this.active_data() else {
-                            return;
-                        };
-                        let total = data.rows.len();
-                        let pane_h = f32::from(bounds.size.height);
-                        if total == 0 || pane_h <= 0. {
-                            return;
-                        }
-                        let layout = data.minimap_layout(pane_h);
-                        let (x0, y0) = (f32::from(bounds.left()), f32::from(bounds.top()));
-                        let usable = f32::from(bounds.size.width) - 2. * MINIMAP_PAD;
-                        let half = (usable - MINIMAP_GAP) / 2.;
-                        for run in &layout.runs {
-                            let (x, w) = match run.lane {
-                                MinimapLane::Full => (0., usable * run.frac),
-                                MinimapLane::Left => (0., half * run.frac),
-                                MinimapLane::Right => (half + MINIMAP_GAP, half * run.frac),
-                            };
-                            let y = run.start as f32 * layout.slot_h;
-                            let h = if run.tick {
-                                1.
-                            } else {
-                                (run.end - run.start) as f32 * layout.slot_h
-                            };
-                            let color: Hsla = match run.color {
-                                MinimapColor::Added => Hsla::from(theme::green()).opacity(0.8),
-                                MinimapColor::Removed => Hsla::from(theme::red()).opacity(0.8),
-                                MinimapColor::Context => {
-                                    Hsla::from(theme::overlay0()).opacity(0.35)
-                                }
-                                MinimapColor::Header => Hsla::from(theme::blue()).opacity(0.5),
-                            };
-                            window.paint_quad(fill(
-                                Bounds::new(
-                                    point(px(x0 + MINIMAP_PAD + x), px(y0 + y)),
-                                    size(px(w.max(1.)), px(h)),
-                                ),
-                                color,
-                            ));
-                        }
-                        let offset_y = f32::from(-data.scroll.0.borrow().base_handle.offset().y);
-                        let px_per_row = layout.slot_h / layout.group as f32;
-                        let top_row = offset_y / row_height();
-                        let visible = (pane_h / row_height()).min(total as f32 - top_row);
-                        let vy = top_row * px_per_row;
-                        let vh = (visible * px_per_row).max(3.);
-                        window.paint_quad(
-                            fill(
-                                Bounds::new(
-                                    point(bounds.left(), px(y0 + vy)),
-                                    size(bounds.size.width, px(vh)),
-                                ),
-                                Hsla::from(theme::text()).opacity(0.08),
-                            )
-                            .border_widths(1.)
-                            .border_color(Hsla::from(theme::overlay0()).opacity(0.4)),
-                        );
-                    },
-                )
-                .size_full(),
-            )
-            .into_any_element()
-    }
-
-    fn render_titlebar(&self) -> impl IntoElement {
+    fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let content: gpui::AnyElement = match &self.state {
             LoadState::Ready(data) => local_titlebar_content(&data.src, data),
             LoadState::Loading => app_title(Some("loading…".to_string())),
@@ -1833,8 +1498,33 @@ impl ReviewApp {
                 .as_ref()
                 .map(|err| SharedString::from(format!("refresh failed: {err}")))
         };
-        TitleBar::new()
+        div()
+            .flex_shrink_0()
+            .h(px(34.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .pl(px(12.))
+            .border_b_1()
+            .border_color(theme::surface0())
+            .bg(theme::mantle())
             .text_size(px(13.))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.titlebar_dragging = true;
+                cx.stop_propagation();
+            }))
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, window, _| {
+                if this.titlebar_dragging {
+                    this.titlebar_dragging = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| {
+                this.titlebar_dragging = false;
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| {
+                this.titlebar_dragging = false;
+            }))
             .child(content)
             .when_some(note, |bar, note| {
                 bar.child(
@@ -1923,7 +1613,7 @@ impl ReviewApp {
         };
 
         div()
-            .w(px(260.))
+            .w(px(self.sidebar_width))
             .flex_shrink_0()
             .h_full()
             .flex()
@@ -1953,42 +1643,91 @@ impl ReviewApp {
             )
     }
 
-    fn render_footer(&self) -> impl IntoElement {
-        let hint = |keys: &[&str], label: &'static str| {
-            let mut hint = div().flex().items_center().gap_1();
-            for key in keys {
-                hint = hint.child(Kbd::new(Keystroke::parse(key).unwrap()));
-            }
-            hint.child(
-                div()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from(label)),
-            )
-        };
+    fn render_sidebar_resizer(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
-            .h(px(28.))
+            .w(px(4.))
             .flex_shrink_0()
+            .h_full()
+            .cursor_col_resize()
+            .bg(theme::surface0())
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                this.sidebar_resizing = true;
+                this.sidebar_resize_start = Some((f32::from(event.position.x), this.sidebar_width));
+                cx.stop_propagation();
+            }))
+            .into_any_element()
+    }
+
+    fn render_keybindings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        const BINDINGS: &[(&str, &str)] = &[
+            ("]", "next file"),
+            ("[", "previous file"),
+            ("n", "next hunk"),
+            ("p", "previous hunk"),
+            ("v", "unified / split"),
+            ("/", "filter files"),
+            ("home", "top"),
+            ("end", "bottom"),
+            ("ctrl-b", "toggle sidebar"),
+            ("r", "refresh"),
+            ("ctrl-=", "bigger font"),
+            ("ctrl--", "smaller font"),
+            ("ctrl-0", "reset font"),
+            ("ctrl-c", "copy selection"),
+            ("ctrl-k", "keybindings"),
+            ("ctrl-q", "quit"),
+        ];
+        div()
+            .absolute()
+            .size_full()
+            .bg(Hsla::from(theme::crust()).opacity(0.8))
             .flex()
             .items_center()
-            .gap_4()
-            .px_3()
-            .bg(theme::mantle())
-            .border_t_1()
-            .border_color(theme::surface0())
-            .text_size(px(12.))
-            .child(hint(&["]", "["], "files"))
-            .child(hint(&["n", "p"], "hunks"))
-            .child(hint(&["v"], "unified/split"))
-            .child(hint(&["m"], "minimap"))
-            .child(hint(&["/"], "filter files"))
-            .child(hint(&["home", "end"], "top/bottom"))
-            .child(hint(&["cmd-b"], "sidebar"))
-            .child(hint(&["r"], "refresh"))
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.keybindings_visible = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("keybindings-panel")
+                    .w(px(460.))
+                    .max_h(px(560.))
+                    .overflow_y_scroll()
+                    .bg(theme::mantle())
+                    .border_1()
+                    .border_color(theme::surface0())
+                    .rounded_lg()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .children(BINDINGS.iter().map(|(key, desc)| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .child(Kbd::new(Keystroke::parse(key).unwrap()))
+                            .child(
+                                div()
+                                    .text_color(theme::overlay0())
+                                    .child(SharedString::from(*desc)),
+                            )
+                    })),
+            )
+            .into_any_element()
     }
+
 }
 
 impl Render for ReviewApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let cell_width = self.split_cell_width(window);
         let entity = cx.entity();
         let pane: gpui::AnyElement = match &self.state {
             LoadState::Loading => centered_message("loading…".into(), theme::overlay0()),
@@ -2006,8 +1745,8 @@ impl Render for ReviewApp {
                 )
                 .into_any_element(),
             LoadState::Ready(data) => {
-                let mode = data.mode;
                 let rows_len = data.rows.len();
+                let widest_row_ix = data.widest_row_ix;
                 let scroll = data.scroll.clone();
                 div()
                     .size_full()
@@ -2033,10 +1772,6 @@ impl Render for ReviewApp {
                         if !event.dragging() {
                             return;
                         }
-                        if this.minimap_scrub {
-                            this.minimap_scrub_to(event.position, cx);
-                            return;
-                        }
                         let Some((side, anchor)) = this.drag_anchor else {
                             return;
                         };
@@ -2058,14 +1793,12 @@ impl Render for ReviewApp {
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseUpEvent, _, _| {
                             this.drag_anchor = None;
-                            this.minimap_scrub = false;
                         }),
                     )
                     .on_mouse_up_out(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseUpEvent, _, _| {
                             this.drag_anchor = None;
-                            this.minimap_scrub = false;
                         }),
                     )
                     .child(
@@ -2082,7 +1815,7 @@ impl Render for ReviewApp {
                                                     .filter(|range| !range.is_empty())
                                                     .map(|range| (sel.side, range))
                                             });
-                                            render_row(row, row_sel)
+                                            render_row(row, row_sel, cell_width)
                                         })
                                         .collect()
                                 }
@@ -2090,17 +1823,14 @@ impl Render for ReviewApp {
                             }
                         })
                         .track_scroll(scroll)
-                        .with_horizontal_sizing_behavior(match mode {
-                            ViewMode::Unified => ListHorizontalSizingBehavior::Unconstrained,
-                            ViewMode::Split => ListHorizontalSizingBehavior::FitList,
-                        })
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .with_width_from_item(Some(widest_row_ix))
                         .h_full()
                         .flex_1()
                         .min_w_0(),
                     )
-                    .when(self.minimap_visible, |pane| {
-                        pane.child(self.render_minimap(cx))
-                    })
                     .child(Scrollbar::new(&data.scroll))
                     .into_any_element()
             }
@@ -2112,6 +1842,25 @@ impl Render for ReviewApp {
             .flex_col()
             .bg(theme::base())
             .text_color(theme::text())
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if !event.dragging() || !this.sidebar_resizing {
+                    return;
+                }
+                let Some((start_x, start_width)) = this.sidebar_resize_start else {
+                    return;
+                };
+                let delta = f32::from(event.position.x) - start_x;
+                this.sidebar_width = (start_width + delta).clamp(180., 640.);
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| {
+                this.sidebar_resizing = false;
+                this.sidebar_resize_start = None;
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| {
+                this.sidebar_resizing = false;
+                this.sidebar_resize_start = None;
+            }))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| {
                 let targets = this
                     .active_data()
@@ -2147,12 +1896,13 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
-            .on_action(cx.listener(|this, _: &ToggleMinimap, _, cx| {
-                this.minimap_visible = !this.minimap_visible;
-                cx.notify();
-            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                if this.keybindings_visible {
+                    this.keybindings_visible = false;
+                    cx.notify();
+                    return;
+                }
                 if let Some(data) = this.active_data_mut() {
                     if data.selection.take().is_some() {
                         cx.notify();
@@ -2178,13 +1928,17 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1., false, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1., false, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(0., true, cx)))
+            .on_action(cx.listener(|this, _: &ToggleKeybindings, _, cx| {
+                this.keybindings_visible = !this.keybindings_visible;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &FocusTreeFilter, window, cx| {
                 this.sidebar_visible = true;
                 this.tree_filter_input
                     .update(cx, |state, cx| state.focus(window, cx));
                 cx.notify();
             }))
-            .child(self.render_titlebar())
+            .child(self.render_titlebar(cx))
             .child(
                 div()
                     .flex_1()
@@ -2192,6 +1946,7 @@ impl Render for ReviewApp {
                     .flex()
                     .when(self.sidebar_visible, |main| {
                         main.child(self.render_sidebar(cx))
+                            .child(self.render_sidebar_resizer(cx))
                     })
                     .child(
                         div()
@@ -2203,7 +1958,9 @@ impl Render for ReviewApp {
                             .child(pane),
                     ),
             )
-            .child(self.render_footer())
+            .when(self.keybindings_visible, |root| {
+                root.child(self.render_keybindings(cx))
+            })
     }
 }
 
@@ -2230,17 +1987,17 @@ fn main() {
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
-                KeyBinding::new("m", ToggleMinimap, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
                 KeyBinding::new("/", FocusTreeFilter, Some("ReviewApp")),
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
-                KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
-                KeyBinding::new("cmd-=", ZoomIn, None),
-                KeyBinding::new("cmd-+", ZoomIn, None),
-                KeyBinding::new("cmd--", ZoomOut, None),
-                KeyBinding::new("cmd-0", ZoomReset, None),
-                KeyBinding::new("cmd-b", ToggleSidebar, None),
-                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("ctrl-c", CopySelection, Some("ReviewApp")),
+                KeyBinding::new("ctrl-=", ZoomIn, None),
+                KeyBinding::new("ctrl-+", ZoomIn, None),
+                KeyBinding::new("ctrl--", ZoomOut, None),
+                KeyBinding::new("ctrl-0", ZoomReset, None),
+                KeyBinding::new("ctrl-b", ToggleSidebar, None),
+                KeyBinding::new("ctrl-q", Quit, None),
+                KeyBinding::new("ctrl-k", ToggleKeybindings, None),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_window_closed(|cx| {
@@ -2276,13 +2033,6 @@ mod tests {
     use super::*;
     use diff_core::Hunk;
 
-    fn ctx(old_no: u32, new_no: u32, text: &str) -> DiffRow {
-        DiffRow::Context {
-            old_no,
-            new_no,
-            text: text.to_string(),
-        }
-    }
     fn add(new_no: u32, text: &str) -> DiffRow {
         DiffRow::Added {
             new_no,
@@ -2359,6 +2109,37 @@ mod tests {
         let entries = build_tree(&["src/main.rs", "README.md"]);
         assert_eq!(entries.len(), 3);
         assert!(matches!(entries[0].kind, TreeEntryKind::Dir { .. }));
+    }
+
+    #[test]
+    fn max_line_chars_spans_unified_and_split() {
+        let rows = vec![
+            Row::Line {
+                old_no: Some(1),
+                new_no: Some(1),
+                kind: LineKind::Context,
+                text: "hello".into(),
+                intra: vec![],
+                syntax: vec![],
+            },
+            Row::SplitLine {
+                left: Some(Cell {
+                    no: 1,
+                    kind: LineKind::Removed,
+                    text: "a very long line".into(),
+                    intra: vec![],
+                    syntax: vec![],
+                }),
+                right: Some(Cell {
+                    no: 1,
+                    kind: LineKind::Added,
+                    text: "short".into(),
+                    intra: vec![],
+                    syntax: vec![],
+                }),
+            },
+        ];
+        assert_eq!(widest_line(&rows), (1, 16));
     }
 
     #[test]

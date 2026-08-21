@@ -6,6 +6,20 @@ Open it inside a repository (or pass a path) and it shows everything that change
 since the diff base — committed, staged, unstaged, and untracked — as one
 reviewable diff. That's it. No accounts, no network.
 
+## Why
+
+When a local agent (Claude Code, a coding assistant, a script, whatever) works in
+your repo, the first question is always the same: *what did it actually change?*
+The answer is the git diff — but reading raw unified diff text in a terminal is
+no way to review anything beyond a handful of files.
+
+This is a viewer for exactly that moment. It was rebuilt from
+[ellie/lgtm](https://github.com/ellie/lgtm) (the PR-review app) with everything
+stripped away except the local diff: no GitHub, no auth, no review comments, no
+chat. Run it where the agent just worked, and you get a proper, review-grade look
+at the working tree — syntax-highlighted, word-level diffs, file tree — before
+you commit or throw it away.
+
 ## Setup
 
 ```sh
@@ -29,8 +43,7 @@ cargo run --release -- /path/to/repo
 - unified + split views
 - tree-sitter syntax highlighting
 - word-level intra-line diffs
-- sidebar file tree with fuzzy filter
-- minimap
+- resizable sidebar with file tree + fuzzy filter
 - mouse selection + copy
 
 ## Keymap
@@ -39,11 +52,11 @@ cargo run --release -- /path/to/repo
 | `]` / `[` | next / previous file |
 | `n` / `p` | next / previous hunk |
 | `v` | unified ↔ split view |
-| `m` | toggle minimap |
 | `/` | focus file filter |
 | `home` / `end` | top / bottom |
-| `cmd-b` | toggle sidebar |
+| `ctrl-b` | toggle sidebar |
 | `r` | refresh |
-| `cmd-+` / `cmd--` / `cmd-0` | diff font size: bigger / smaller / reset |
-| `cmd-c` | copy selection |
-| `cmd-q` | quit |
+| `ctrl-+` / `ctrl--` / `ctrl-0` | diff font size: bigger / smaller / reset |
+| `ctrl-c` | copy selection |
+| `ctrl-k` | show keybindings |
+| `ctrl-q` | quit |
