@@ -2716,6 +2716,9 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // Wayland app_id; matches omarchy/agent-review.desktop so
+                    // the compositor finds the launcher's icon.
+                    app_id: Some("agent-review".into()),
                     titlebar: Some(TitlebarOptions {
                         title: Some("lgtm".into()),
                         ..TitleBar::title_bar_options()

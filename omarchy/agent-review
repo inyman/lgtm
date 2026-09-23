@@ -1,0 +1,42 @@
+#!/bin/bash
+# Launch lgtm (agent-review) on a project: pick a git repo under ~/Projects,
+# then build lgtm from its checkout and open the picked repo's diff.
+#
+# The picker lists every git repo directly under ~/Projects, most recently
+# touched first, each with its branch and how many files have changes.
+
+lgtm_repo="__LGTM_REPO__"
+projects="$HOME/Projects"
+
+paths=()
+rows=()
+while IFS= read -r dir; do
+  [[ -e "$dir/.git" ]] || continue
+  branch=$(git -C "$dir" branch --show-current 2>/dev/null)
+  [[ -z "$branch" ]] && branch="detached"
+  changed=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l)
+  paths+=("$dir")
+  # omarchy-menu-select rows are "<glyph><TAB><label><TAB><subtext>"; it
+  # returns "<label><TAB><subtext>", which the subtext keeps unique.
+  rows+=($'\t'"$(basename "$dir")"$'\t'"$branch · $changed changed · ${dir/#$HOME/\~}")
+done < <(ls -1dt "$projects"/*/ 2>/dev/null | sed 's#/$##')
+
+if (( ${#paths[@]} == 0 )); then
+  notify-send "agent-review" "No git repos found in ${projects/#$HOME/\~}"
+  exit 1
+fi
+
+picked=$(omarchy-menu-select "agent-review — project" "${rows[@]}" -- --width 700) || exit 0
+choice=-1
+for i in "${!rows[@]}"; do
+  [[ "${rows[$i]#$'\t'}" == "$picked" ]] && choice=$i
+done
+(( choice >= 0 )) || exit 0
+dir="${paths[$choice]}"
+
+cd "$lgtm_repo" || exit 1
+if ! build_log=$(cargo build --release --quiet 2>&1); then
+  notify-send -u critical "agent-review: build failed" "$(tail -n 5 <<<"$build_log")"
+  exit 1
+fi
+exec "$lgtm_repo/target/release/lgtm" "$dir"

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Name=agent-review
+Comment=Review a project's local diff in lgtm
+Exec=agent-review
+Icon=agent-review
+Terminal=false
+Type=Application
+Categories=Development;
+Keywords=lgtm;diff;review;git;agent;
+StartupNotify=true
+StartupWMClass=agent-review
