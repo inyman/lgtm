@@ -12,7 +12,7 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
     actions, div, font, point, prelude::*, px, size, uniform_list, App,
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
-    Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, ScrollWheelEvent,
     MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString, StyledText, Subscription,
     TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
@@ -32,7 +32,7 @@ const MONO: &str = "JetBrainsMono Nerd Font";
 
 /// Diff pane font size in px, adjustable at runtime (cmd-+ / cmd-- / cmd-0).
 static FONT_PX: AtomicU32 = AtomicU32::new(DEFAULT_TEXT_SIZE as u32);
-const DEFAULT_TEXT_SIZE: f32 = 13.0;
+const DEFAULT_TEXT_SIZE: f32 = 15.0;
 const MIN_TEXT_SIZE: f32 = 7.0;
 const MAX_TEXT_SIZE: f32 = 28.0;
 const LINE_HEIGHT_RATIO: f32 = 1.7;
@@ -62,6 +62,14 @@ actions!(
         PrevFile,
         NextHunk,
         PrevHunk,
+        HunkDown,
+        HunkUp,
+        TreeUp,
+        TreeDown,
+        TreeOpen,
+        TreeCollapse,
+        TreeExpand,
+        FocusDiff,
         GoToTop,
         GoToBottom,
         ToggleView,
@@ -223,13 +231,34 @@ fn widest_line(rows: &[Row]) -> (usize, usize) {
     (best_ix, best_chars)
 }
 
-fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
+/// Files matching the sidebar's "filter files…" query, or None when the
+/// query is empty (everything shown).
+fn shown_files(diff: &PrDiff, query: &str) -> Option<HashSet<usize>> {
+    if query.trim().is_empty() {
+        return None;
+    }
+    let paths: Vec<&str> = diff.files.iter().map(|f| f.display_path()).collect();
+    Some(fuzzy_file_matches(&paths, query).into_iter().collect())
+}
+
+/// `only` limits the rows to those files. `file_rows` still has one entry
+/// per file in `diff`; a hidden file points at the row where the next shown
+/// file starts (or past the end), so file-index lookups stay valid.
+fn build_rows(
+    diff: &PrDiff,
+    mode: ViewMode,
+    only: Option<&HashSet<usize>>,
+) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut file_rows = Vec::new();
     let mut hunk_rows = Vec::new();
 
-    for file in &diff.files {
+    for (file_ix, file) in diff.files.iter().enumerate() {
         let path = file.display_path();
+        if only.is_some_and(|only| !only.contains(&file_ix)) {
+            file_rows.push(rows.len() + usize::from(!rows.is_empty()));
+            continue;
+        }
         if !rows.is_empty() {
             rows.push(Row::Spacer);
         }
@@ -509,7 +538,9 @@ fn line_content(
     }
 }
 
-fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>, cell_width: Pixels) -> gpui::AnyElement {
+/// `split_x` is the horizontal text scroll shared by both split cells; the
+/// cells themselves stay pinned to half the pane so both sides are visible.
+fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>, split_x: Pixels) -> gpui::AnyElement {
     let row_height = px(row_height());
     match row {
         Row::Spacer => div().h(row_height).into_any_element(),
@@ -632,8 +663,8 @@ fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>, cell_width:
             };
             let cell = |cell: &Option<Cell>, sel: Option<Range<usize>>| {
                 let base = div()
-                    .w(cell_width)
-                    .flex_shrink_0()
+                    .flex_1()
+                    .min_w_0()
                     .overflow_hidden()
                     .h_full()
                     .flex()
@@ -664,15 +695,32 @@ fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>, cell_width:
                         .text_color(marker_color)
                         .child(SharedString::from(marker)),
                 )
-                .child(div().whitespace_nowrap().child(line_content(
-                    &cell.text,
-                    &cell.syntax,
-                    &cell.intra,
-                    word_bg,
-                    sel,
-                )))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .relative()
+                                .left(-split_x)
+                                .whitespace_nowrap()
+                                .child(line_content(
+                                    &cell.text,
+                                    &cell.syntax,
+                                    &cell.intra,
+                                    word_bg,
+                                    sel,
+                                )),
+                        ),
+                )
             };
             div()
+                .w_full()
                 .h(row_height)
                 .flex()
                 .child(cell(left, left_sel))
@@ -694,7 +742,7 @@ fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>, cell_width:
 
 // --- Sidebar file tree ---------------------------------------------------
 
-const TREE_ROW_HEIGHT: f32 = 24.0;
+const TREE_ROW_HEIGHT: f32 = 28.0;
 
 #[derive(Debug, PartialEq)]
 struct TreeEntry {
@@ -820,6 +868,7 @@ fn render_tree_row(
     row: TreeListRow,
     pos: usize,
     current: bool,
+    cursor: bool,
     data: &ItemData,
     entity: &gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
@@ -829,7 +878,7 @@ fn render_tree_row(
             .items_center()
             .gap_1()
             .flex_shrink_0()
-            .text_size(px(10.))
+            .text_size(px(12.))
             .child(
                 div()
                     .text_color(Hsla::from(theme::green()).opacity(0.7))
@@ -854,7 +903,8 @@ fn render_tree_row(
         .when(current, |row| row.bg(theme::surface0()))
         .when(!current, |row| {
             row.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-        });
+        })
+        .when(cursor, |row| row.bg(Hsla::from(theme::blue()).opacity(0.25)));
     match row {
         TreeListRow::Entry(entry_ix) => {
             let entry = &data.tree[entry_ix];
@@ -920,6 +970,43 @@ fn render_tree_row(
         }
     }
 }
+
+    fn render_exclude_tag(
+        ix: usize,
+        pattern: SharedString,
+        entity: &gpui::Entity<ReviewApp>,
+    ) -> gpui::AnyElement {
+        let entity = entity.clone();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(theme::surface0())
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(px(12.))
+            .max_w_full()
+            .child(
+                div()
+                    .text_color(theme::text())
+                    .truncate()
+                    .child(pattern.clone()),
+            )
+            .child(
+                div()
+                    .id(("exclude-remove", ix))
+                    .flex_shrink_0()
+                    .text_color(theme::overlay0())
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme::red()))
+                    .child(SharedString::from("×"))
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| this.remove_exclude(ix, cx));
+                    }),
+            )
+            .into_any_element()
+    }
 
 // --- Selection ------------------------------------------------------------
 
@@ -1015,6 +1102,7 @@ struct ItemData {
     hunk_rows: Vec<usize>,
     max_line_chars: usize,
     widest_row_ix: usize,
+    split_scroll_x: f32,
     cursor: usize,
     scroll: UniformListScrollHandle,
     additions: u32,
@@ -1036,6 +1124,45 @@ impl ItemData {
         self.hunk_rows = hunk_rows;
     }
 
+    /// The file being looked at: the cursor's file while the cursor is on
+    /// screen (hunk jumps center their hunk, so the top row can still be the
+    /// previous file's tail), else the file at the top of the viewport.
+    fn viewed_file(&self) -> Option<usize> {
+        let rh = row_height();
+        let scroll = self.scroll.0.borrow();
+        let (top, bottom) = match &scroll.deferred_scroll_to_item {
+            Some(deferred) => (deferred.item_index, usize::MAX),
+            None => {
+                let top_px = f32::from(-scroll.base_handle.offset().y).max(0.);
+                let height = f32::from(scroll.base_handle.bounds().size.height);
+                ((top_px / rh) as usize, ((top_px + height) / rh) as usize)
+            }
+        };
+        drop(scroll);
+        let row = if (top..bottom).contains(&self.cursor) {
+            self.cursor
+        } else {
+            top
+        };
+        self.file_rows.iter().rposition(|&ix| ix <= row)
+    }
+
+    /// The hunk the cursor is in, as (index into `hunk_rows`, first row,
+    /// end row exclusive). None when the cursor sits on a file header or
+    /// before the first hunk.
+    fn current_hunk(&self) -> Option<(usize, usize, usize)> {
+        let pos = self.hunk_rows.iter().rposition(|&ix| ix <= self.cursor)?;
+        let start = self.hunk_rows[pos];
+        let next_hunk = self.hunk_rows.get(pos + 1).copied();
+        let next_file = self.file_rows.iter().copied().find(|&ix| ix > start);
+        let end = [next_hunk, next_file]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(self.rows.len());
+        (self.cursor < end).then_some((pos, start, end))
+    }
+
     fn rebuild_tree(&mut self) {
         let paths: Vec<&str> = self.diff.files.iter().map(|f| f.display_path()).collect();
         let tree = build_tree(&paths);
@@ -1055,16 +1182,110 @@ struct Loaded {
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
     mode: ViewMode,
+    excluded: usize,
+    patch_hash: u64,
 }
 
-fn fetch_item(path: &Path, mode: ViewMode) -> anyhow::Result<Loaded> {
+/// Whether a changed path can affect the diff: worktree files, plus `HEAD` and
+/// refs (commits, checkouts). The rest of `.git` and build/dependency dirs
+/// churn constantly without changing what we show.
+fn is_relevant_change(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut parts = rel.components().map(|c| c.as_os_str());
+    match parts.next() {
+        None => false,
+        Some(first) if first == ".git" => match parts.next() {
+            Some(second) => second == "HEAD" || second == "refs",
+            None => false,
+        },
+        Some(first) => std::iter::once(first)
+            .chain(parts)
+            .all(|part| part != "node_modules" && part != "target"),
+    }
+}
+
+/// Patterns excluded on startup; each shows as a removable tag.
+const DEFAULT_EXCLUDES: &[&str] = &["__generated__", "*.wasm", "*.glb", "*.png"];
+
+/// Whether `path` is excluded by `pattern`. The glob is tried against every
+/// run of whole path segments, so `__generated__` excludes any file under a
+/// directory of that name, `*.snap` matches by basename, and
+/// `*/__generated__/*` also covers a top-level `__generated__/`.
+fn path_excluded(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim_start_matches("./").trim_matches('/');
+    let pattern = pattern.trim_start_matches("*/").trim_end_matches("/*");
+    if pattern.is_empty() {
+        return false;
+    }
+    let starts = std::iter::once(0).chain(path.match_indices('/').map(|(i, _)| i + 1));
+    let ends: Vec<usize> = path
+        .match_indices('/')
+        .map(|(i, _)| i)
+        .chain(std::iter::once(path.len()))
+        .collect();
+    starts.into_iter().any(|start| {
+        ends.iter()
+            .filter(|&&end| end > start)
+            .any(|&end| glob_match(pattern, &path[start..end]))
+    })
+}
+
+/// Simple wildcard match: `*` matches any run of characters (including `/`),
+/// `?` a single character.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = text.chars().collect();
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star, mut star_s) = (None, 0usize);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_s = si;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            star_s += 1;
+            si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn fetch_item(
+    path: &Path,
+    mode: ViewMode,
+    exclude: &[String],
+    query: &str,
+) -> anyhow::Result<Loaded> {
     let src = git::resolve_local(path)?;
     let patch = git::diff_patch(&src)?;
-    let diff = diff_core::parse_patch(&patch);
-    let (rows, file_rows, hunk_rows) = build_rows(&diff, mode);
+    let patch_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        patch.hash(&mut h);
+        h.finish()
+    };
+    let mut diff = diff_core::parse_patch(&patch);
+    let total = diff.files.len();
+    diff.files
+        .retain(|f| !exclude.iter().any(|pat| path_excluded(pat, f.display_path())));
+    let excluded = total - diff.files.len();
+    let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, shown_files(&diff, query).as_ref());
     Ok(Loaded {
         src,
         diff,
+        excluded,
+        patch_hash,
         rows,
         file_rows,
         hunk_rows,
@@ -1126,6 +1347,13 @@ fn local_titlebar_content(src: &git::LocalSource, data: &ItemData) -> gpui::AnyE
                 .text_color(theme::overlay0())
                 .child(SharedString::from(format!("vs {}", src.base_label))),
         )
+        .when_some(data.current_hunk(), |bar, (pos, _, _)| {
+            bar.child(div().text_color(theme::blue()).child(SharedString::from(format!(
+                "hunk {}/{}",
+                pos + 1,
+                data.hunk_rows.len()
+            ))))
+        })
         .into_any_element()
 }
 
@@ -1148,7 +1376,22 @@ struct ReviewApp {
     titlebar_dragging: bool,
     keybindings_visible: bool,
     tree_filter_input: gpui::Entity<InputState>,
+    exclude_input: gpui::Entity<InputState>,
+    exclude: Vec<String>,
+    /// Excludes the last fetch was spawned with, to skip no-op refetches.
+    applied_exclude: Vec<String>,
+    exclude_debounce: Option<gpui::Task<()>>,
+    excluded_count: usize,
+    /// Hash of the patch behind the installed rows, plus the mode/excludes it
+    /// was built with; a refetch that matches is dropped so watcher noise
+    /// doesn't reset scroll or selection.
+    installed_key: Option<(u64, ViewMode, Vec<String>)>,
+    _watcher: Option<notify::RecommendedWatcher>,
     focus_handle: FocusHandle,
+    /// Keyboard focus for the sidebar file tree, and its cursor (a position
+    /// in `tree_list_rows`).
+    tree_focus: FocusHandle,
+    tree_cursor: usize,
     drag_anchor: Option<(SelSide, RowCol)>,
     char_width: Option<Pixels>,
     repo_path: PathBuf,
@@ -1159,32 +1402,55 @@ impl ReviewApp {
     fn new(repo_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
-        let _subscriptions = vec![cx.subscribe_in(
-            &tree_filter_input,
-            window,
-            |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => this.tree_filter_confirm(window, cx),
-                InputEvent::Change => {
-                    if let Some(data) = this.active_data() {
-                        data.tree_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        let exclude_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("exclude, e.g. __generated__ (enter to pin)")
+        });
+        let _subscriptions = vec![
+            cx.subscribe_in(
+                &tree_filter_input,
+                window,
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => this.tree_filter_confirm(window, cx),
+                    InputEvent::Change => {
+                        if let Some(data) = this.active_data() {
+                            data.tree_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        }
+                        this.apply_file_filter(cx);
                     }
-                    cx.notify();
-                }
-                _ => {}
-            },
-        )];
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &exclude_input,
+                window,
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => this.add_exclude(window, cx),
+                    InputEvent::Change => this.exclude_draft_changed(cx),
+                    _ => {}
+                },
+            ),
+        ];
         let mut this = Self {
             state: LoadState::Loading,
             reloading: false,
             refresh_error: None,
             sidebar_visible: true,
-            sidebar_width: 260.,
+            sidebar_width: 340.,
             sidebar_resizing: false,
             sidebar_resize_start: None,
             titlebar_dragging: false,
             keybindings_visible: false,
             tree_filter_input,
+            exclude_input,
+            exclude: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
+            applied_exclude: Vec::new(),
+            exclude_debounce: None,
+            excluded_count: 0,
+            installed_key: None,
+            _watcher: None,
             focus_handle: cx.focus_handle(),
+            tree_focus: cx.focus_handle(),
+            tree_cursor: 0,
             drag_anchor: None,
             char_width: None,
             repo_path,
@@ -1196,14 +1462,40 @@ impl ReviewApp {
 
     fn spawn_fetch(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         let repo = self.repo_path.clone();
+        let exclude = self.effective_exclude(cx);
+        self.applied_exclude = exclude.clone();
+        let query = self.tree_filter_input.read(cx).value().to_string();
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { fetch_item(&repo, mode) })
+                .background_spawn({
+                    let exclude = exclude.clone();
+                    let query = query.clone();
+                    async move { fetch_item(&repo, mode, &exclude, &query) }
+                })
                 .await;
             this.update(cx, |app, cx| {
                 app.reloading = false;
+                // Excludes changed mid-fetch (the refresh they asked for was
+                // skipped while this one ran): fetch again with the new list.
+                if app.effective_exclude(cx) != exclude {
+                    app.reloading = matches!(app.state, LoadState::Ready(_));
+                    app.spawn_fetch(mode, cx);
+                    return;
+                }
                 match fetched {
-                    Ok(loaded) => app.install(loaded),
+                    Ok(loaded) => {
+                        let key = Some((loaded.patch_hash, loaded.mode, exclude));
+                        let unchanged = key == app.installed_key
+                            && matches!(&app.state, LoadState::Ready(d) if d.mode == loaded.mode);
+                        if !unchanged {
+                            app.installed_key = key;
+                            app.install(loaded, cx);
+                            // The file filter changed while fetching.
+                            if app.tree_filter_input.read(cx).value().to_string() != query {
+                                app.apply_file_filter(cx);
+                            }
+                        }
+                    }
                     Err(err) => {
                         let msg = format!("{err:#}");
                         match &app.state {
@@ -1219,7 +1511,7 @@ impl ReviewApp {
         .detach();
     }
 
-    fn install(&mut self, loaded: Loaded) {
+    fn install(&mut self, loaded: Loaded, cx: &mut Context<Self>) {
         let Loaded {
             src,
             diff,
@@ -1227,7 +1519,13 @@ impl ReviewApp {
             file_rows,
             hunk_rows,
             mode,
+            excluded,
+            patch_hash: _,
         } = loaded;
+        if self._watcher.is_none() {
+            self.watch_repo(src.repo_root.clone(), cx);
+        }
+        self.excluded_count = excluded;
         let (additions, deletions) = diff
             .files
             .iter()
@@ -1255,6 +1553,7 @@ impl ReviewApp {
                     hunk_rows,
                     max_line_chars,
                     widest_row_ix,
+                    split_scroll_x: 0.,
                     cursor: 0,
                     scroll: UniformListScrollHandle::new(),
                     additions,
@@ -1320,18 +1619,20 @@ impl ReviewApp {
         })
     }
 
-    /// Width of one split-view cell: half the pane, or wide enough for the
-    /// longest line, whichever is larger — so long lines overflow into the
-    /// list's horizontal scroll rather than being clipped.
-    fn split_cell_width(&mut self, window: &Window) -> Pixels {
+    /// Scroll split-view text horizontally, clamped so the longest line's end
+    /// can just reach the right edge of its (half-pane) cell.
+    fn scroll_split_x(&mut self, delta: f32, window: &Window) -> bool {
         let char_w = f32::from(self.char_width(window)).max(1.);
-        let Some(data) = self.active_data() else {
-            return px(0.);
+        let Some(data) = self.active_data_mut() else {
+            return false;
         };
         let pane_w = f32::from(data.scroll.0.borrow().base_handle.bounds().size.width);
-        let half = (pane_w - SPLIT_DIVIDER) / 2.;
-        let content = SPLIT_GUTTER + (data.max_line_chars as f32) * char_w;
-        px(half.max(content))
+        let text_w = (pane_w - SPLIT_DIVIDER) / 2. - SPLIT_GUTTER;
+        let max = ((data.max_line_chars as f32) * char_w - text_w + char_w).max(0.);
+        let x = (data.split_scroll_x - delta).clamp(0., max);
+        let changed = x != data.split_scroll_x;
+        data.split_scroll_x = x;
+        changed
     }
 
     fn pane_hit(
@@ -1377,10 +1678,80 @@ impl ReviewApp {
                     SelSide::Right => rel_x - half - SPLIT_DIVIDER,
                     _ => rel_x,
                 };
-                (side, cell_x - SPLIT_GUTTER)
+                (side, cell_x - SPLIT_GUTTER + data.split_scroll_x)
             }
         };
         Some((side, row, px(text_x)))
+    }
+
+    /// Refresh when files in the repo change. Events are drained on a short
+    /// tick so a burst of saves (formatters, `git checkout`) is one refetch.
+    fn watch_repo(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        use notify::Watcher;
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        let watch_root = root.clone();
+        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                if matches!(event.kind, notify::EventKind::Access(_)) {
+                    return;
+                }
+                for path in event.paths {
+                    if is_relevant_change(&watch_root, &path) {
+                        tx.send(path).ok();
+                    }
+                }
+            }
+        });
+        let mut watcher = match watcher {
+            Ok(w) => w,
+            Err(err) => {
+                self.refresh_error = Some(format!("file watching unavailable: {err}").into());
+                return;
+            }
+        };
+        if let Err(err) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
+            self.refresh_error = Some(format!("file watching unavailable: {err}").into());
+            return;
+        }
+        self._watcher = Some(watcher);
+        cx.spawn(async move |this, cx| {
+            let mut dirty = false;
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(300))
+                    .await;
+                let mut paths: Vec<PathBuf> = rx.try_iter().collect();
+                paths.sort();
+                paths.dedup();
+                if !paths.is_empty() && !dirty {
+                    // Build output (dist/, caches) is usually gitignored and
+                    // can't change the diff; `.git` paths are never "ignored".
+                    let root = root.clone();
+                    dirty = cx
+                        .background_spawn(async move {
+                            paths.iter().any(|p| p.starts_with(root.join(".git")))
+                                || git::any_unignored(&root, &paths)
+                        })
+                        .await;
+                }
+                if !dirty {
+                    continue;
+                }
+                let Ok(refreshed) = this.update(cx, |app, cx| {
+                    if app.reloading || matches!(app.state, LoadState::Loading) {
+                        return false;
+                    }
+                    app.refresh(cx);
+                    true
+                }) else {
+                    break;
+                };
+                if refreshed {
+                    dirty = false;
+                }
+            }
+        })
+        .detach();
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -1400,7 +1771,19 @@ impl ReviewApp {
         cx.notify();
     }
 
+    /// Rebuild the diff rows so the pane shows only the files matching the
+    /// "filter files…" query, like the sidebar does.
+    fn apply_file_filter(&mut self, cx: &mut Context<Self>) {
+        let query = self.tree_filter_input.read(cx).value().to_string();
+        if let Some(data) = self.active_data_mut() {
+            data.set_rows(build_rows(&data.diff, data.mode, shown_files(&data.diff, &query).as_ref()));
+            data.selection = None;
+        }
+        self.jump(0, cx);
+    }
+
     fn toggle_view(&mut self, cx: &mut Context<Self>) {
+        let query = self.tree_filter_input.read(cx).value().to_string();
         let Some(data) = self.active_data_mut() else {
             return;
         };
@@ -1410,26 +1793,81 @@ impl ReviewApp {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
         };
-        data.set_rows(build_rows(&data.diff, data.mode));
+        data.set_rows(build_rows(&data.diff, data.mode, shown_files(&data.diff, &query).as_ref()));
         let target = file_pos
             .and_then(|pos| data.file_rows.get(pos).copied())
             .unwrap_or(0);
         self.jump(target, cx);
     }
 
+    /// Move the cursor to `ix`. A hunk that fits on screen is centered
+    /// vertically as a block; anything else (file headers, tall hunks) is
+    /// aligned to the top so its start is visible.
     fn jump(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(data) = self.active_data_mut() {
             data.cursor = ix;
-            data.scroll.scroll_to_item_strict(ix, ScrollStrategy::Top);
+            let rh = row_height();
+            let handle = data.scroll.0.borrow().base_handle.clone();
+            let viewport = f32::from(handle.bounds().size.height);
+            match data.current_hunk() {
+                Some((_, start, end))
+                    if viewport > 0. && (end - start) as f32 * rh < viewport =>
+                {
+                    let block = (end - start) as f32 * rh;
+                    let max = (data.rows.len() as f32 * rh - viewport).max(0.);
+                    let top = (start as f32 * rh - (viewport - block) / 2.).clamp(0., max);
+                    handle.set_offset(point(handle.offset().x, px(-top)));
+                }
+                _ => data.scroll.scroll_to_item_strict(ix, ScrollStrategy::Top),
+            }
         }
         cx.notify();
+    }
+
+    /// Arrow-key stepping: while the current hunk runs past the screen edge
+    /// in the direction of travel, scroll by a page (keeping a few rows of
+    /// overlap) until its end is visible; only then move to the next or
+    /// previous hunk.
+    fn step_hunk(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(data) = self.active_data() else {
+            return;
+        };
+        if let Some((_, start, end)) = data.current_hunk() {
+            let rh = row_height();
+            let handle = data.scroll.0.borrow().base_handle.clone();
+            let viewport = f32::from(handle.bounds().size.height);
+            let top = -f32::from(handle.offset().y);
+            let page = (viewport - 3. * rh).max(rh);
+            let (start_y, end_y) = (start as f32 * rh, end as f32 * rh);
+            let new_top = if viewport <= 0. {
+                None
+            } else if forward && end_y > top + viewport + 0.5 {
+                Some((top + page).min(end_y - viewport))
+            } else if !forward && start_y < top - 0.5 {
+                Some((top - page).max(start_y))
+            } else {
+                None
+            };
+            if let Some(new_top) = new_top {
+                handle.set_offset(point(handle.offset().x, px(-new_top.max(0.))));
+                cx.notify();
+                return;
+            }
+        }
+        let targets = data.hunk_rows.clone();
+        if forward {
+            self.jump_next(&targets, cx)
+        } else {
+            self.jump_prev(&targets, cx)
+        }
     }
 
     fn jump_next(&mut self, targets: &[usize], cx: &mut Context<Self>) {
         let Some(cursor) = self.active_data().map(|data| data.cursor) else {
             return;
         };
-        if let Some(&ix) = targets.iter().find(|&&ix| ix > cursor) {
+        let len = self.active_data().map_or(0, |data| data.rows.len());
+        if let Some(&ix) = targets.iter().find(|&&ix| ix > cursor && ix < len) {
             self.jump(ix, cx);
         }
     }
@@ -1485,6 +1923,51 @@ impl ReviewApp {
         }
     }
 
+    fn add_exclude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pattern = self.exclude_input.read(cx).value().trim().to_string();
+        if pattern.is_empty() {
+            return;
+        }
+        self.exclude_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        if !self.exclude.contains(&pattern) {
+            self.exclude.push(pattern);
+        }
+        if self.effective_exclude(cx) != self.applied_exclude {
+            self.refresh(cx);
+        }
+    }
+
+    /// Pinned excludes plus whatever is typed in the exclude box, so a
+    /// pattern takes effect while typing, before Enter pins it as a tag.
+    fn effective_exclude(&self, cx: &App) -> Vec<String> {
+        let mut exclude = self.exclude.clone();
+        let draft = self.exclude_input.read(cx).value().trim().to_string();
+        if !draft.is_empty() && !exclude.contains(&draft) {
+            exclude.push(draft);
+        }
+        exclude
+    }
+
+    fn exclude_draft_changed(&mut self, cx: &mut Context<Self>) {
+        self.exclude_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.effective_exclude(cx) != this.applied_exclude {
+                    this.refresh(cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn remove_exclude(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.exclude.remove(ix);
+        self.refresh(cx);
+    }
+
     fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let content: gpui::AnyElement = match &self.state {
             LoadState::Ready(data) => local_titlebar_content(&data.src, data),
@@ -1538,31 +2021,129 @@ impl ReviewApp {
             })
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The sidebar's rows: the collapsible tree, or a flat list of matches
+    /// while the file filter has a query.
+    fn tree_list_rows(&self, cx: &App) -> Vec<TreeListRow> {
         let query = self.tree_filter_input.read(cx).value().trim().to_string();
-        let mut tree_rows: Vec<TreeListRow> = Vec::new();
+        let Some(data) = self.active_data() else {
+            return Vec::new();
+        };
+        if query.is_empty() {
+            visible_entries(&data.tree, &data.collapsed)
+                .into_iter()
+                .map(TreeListRow::Entry)
+                .collect()
+        } else {
+            let paths: Vec<&str> = data.diff.files.iter().map(|f| f.display_path()).collect();
+            fuzzy_file_matches(&paths, &query)
+                .into_iter()
+                .map(TreeListRow::FilteredFile)
+                .collect()
+        }
+    }
+
+    /// The file a sidebar row stands for (None for directories).
+    fn tree_row_file(&self, row: TreeListRow) -> Option<usize> {
+        match row {
+            TreeListRow::FilteredFile(file_ix) => Some(file_ix),
+            TreeListRow::Entry(ix) => match &self.active_data()?.tree.get(ix)?.kind {
+                &TreeEntryKind::File { file_ix } => Some(file_ix),
+                TreeEntryKind::Dir { .. } => None,
+            },
+        }
+    }
+
+    /// Focus the file tree with its cursor on the file shown in the diff.
+    fn focus_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = true;
+        let rows = self.tree_list_rows(cx);
+        let current = self.active_data().and_then(|data| data.viewed_file());
+        if let Some(pos) = current.and_then(|file| {
+            rows.iter().position(|&row| self.tree_row_file(row) == Some(file))
+        }) {
+            self.tree_cursor = pos;
+        }
+        self.tree_cursor = self.tree_cursor.min(rows.len().saturating_sub(1));
+        window.focus(&self.tree_focus);
+        cx.notify();
+    }
+
+    /// Move the tree cursor; landing on a file shows it in the diff while
+    /// focus stays in the tree.
+    fn tree_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let rows = self.tree_list_rows(cx);
+        if rows.is_empty() {
+            return;
+        }
+        let pos = (self.tree_cursor as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+        self.tree_cursor = pos;
+        if let Some(data) = self.active_data() {
+            data.tree_scroll.scroll_to_item(pos, ScrollStrategy::Center);
+        }
+        // Land on the file's first hunk so it becomes the current hunk and
+        // ↑/↓ in the diff continue from there; header-only files (binary,
+        // pure renames) land on the header.
+        let row = self.tree_row_file(rows[pos]).and_then(|file| {
+            let data = self.active_data()?;
+            let header = *data.file_rows.get(file)?;
+            let next_file = data
+                .file_rows
+                .iter()
+                .copied()
+                .find(|&ix| ix > header)
+                .unwrap_or(data.rows.len());
+            let first_hunk = data
+                .hunk_rows
+                .iter()
+                .copied()
+                .find(|&ix| ix > header && ix < next_file);
+            Some(first_hunk.unwrap_or(header))
+        });
+        match row {
+            Some(row) => self.jump(row, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// Enter on a file returns focus to the diff; on a directory it folds or
+    /// unfolds it. Left/right (`fold` = Some) fold/unfold directories only.
+    fn tree_activate(&mut self, fold: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.tree_list_rows(cx);
+        let Some(&row) = rows.get(self.tree_cursor) else {
+            return;
+        };
+        if let TreeListRow::Entry(entry_ix) = row {
+            if let Some(data) = self.active_data_mut() {
+                if let Some(TreeEntryKind::Dir { path }) =
+                    data.tree.get(entry_ix).map(|entry| &entry.kind)
+                {
+                    let path = path.clone();
+                    let collapse = fold.unwrap_or(!data.collapsed.contains(&path));
+                    if collapse {
+                        data.collapsed.insert(path);
+                    } else {
+                        data.collapsed.remove(&path);
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        if fold.is_none() && self.tree_row_file(row).is_some() {
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
+    }
+
+    fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.tree_filter_input.read(cx).value().trim().to_string();
+        let tree_rows = self.tree_list_rows(cx);
+        let tree_focused = self.tree_focus.is_focused(window);
+        let tree_cursor = self.tree_cursor;
         let mut current_file = None;
         let mut current_row = None;
         if let Some(data) = self.active_data() {
-            if query.is_empty() {
-                tree_rows = visible_entries(&data.tree, &data.collapsed)
-                    .into_iter()
-                    .map(TreeListRow::Entry)
-                    .collect();
-            } else {
-                let paths: Vec<&str> = data.diff.files.iter().map(|f| f.display_path()).collect();
-                tree_rows = fuzzy_file_matches(&paths, &query)
-                    .into_iter()
-                    .map(TreeListRow::FilteredFile)
-                    .collect();
-            }
-            let scroll = data.scroll.0.borrow();
-            let top_row = match &scroll.deferred_scroll_to_item {
-                Some(deferred) => deferred.item_index,
-                None => (f32::from(-scroll.base_handle.offset().y) / row_height()).max(0.) as usize,
-            };
-            drop(scroll);
-            current_file = data.file_rows.iter().rposition(|&ix| ix <= top_row);
+            current_file = data.viewed_file();
             current_row = current_file.and_then(|file| {
                 tree_rows.iter().position(|row| match row {
                     TreeListRow::Entry(ix) => matches!(
@@ -1587,6 +2168,7 @@ impl ReviewApp {
         let entity = cx.entity();
         let tree_list: gpui::AnyElement = match tree_scroll {
             Some(scroll) if !tree_rows.is_empty() => {
+                let entity = entity.clone();
                 uniform_list("file-tree", tree_rows.len(), move |range, _window, cx| {
                     let this = entity.read(cx);
                     let Some(data) = this.active_data() else {
@@ -1595,7 +2177,14 @@ impl ReviewApp {
                     range
                         .filter_map(|pos| tree_rows.get(pos).map(|row| (pos, *row)))
                         .map(|(pos, row)| {
-                            render_tree_row(row, pos, current_row == Some(pos), data, &entity)
+                            render_tree_row(
+                                row,
+                                pos,
+                                current_row == Some(pos),
+                                tree_focused && pos == tree_cursor,
+                                data,
+                                &entity,
+                            )
                         })
                         .collect()
                 })
@@ -1621,16 +2210,16 @@ impl ReviewApp {
             .bg(theme::mantle())
             .border_r_1()
             .border_color(theme::surface0())
-            .text_size(px(12.))
+            .text_size(px(14.))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_col()
+                    // Escape in the sidebar hands focus back to the diff; the
+                    // filter stays applied (it also filters the diff pane).
                     .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                        this.tree_filter_input
-                            .update(cx, |state, cx| state.set_value("", window, cx));
                         window.focus(&this.focus_handle);
                         cx.notify();
                     }))
@@ -1639,7 +2228,68 @@ impl ReviewApp {
                             .p_2()
                             .child(Input::new(&self.tree_filter_input).small()),
                     )
-                    .child(div().flex_1().min_h_0().child(tree_list)),
+                    .when(!self.exclude.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .px_2()
+                                .pb_1()
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .children(
+                                    self.exclude
+                                        .iter()
+                                        .cloned()
+                                        .enumerate()
+                                        .map(|(ix, pat)| {
+                                            render_exclude_tag(ix, SharedString::from(pat), &entity)
+                                        }),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .px_2()
+                            .pb_1()
+                            .child(Input::new(&self.exclude_input).small()),
+                    )
+                    .when(self.excluded_count > 0, |col| {
+                        let n = self.excluded_count;
+                        col.child(
+                            div()
+                                .px_2()
+                                .pb_1()
+                                .text_size(px(12.))
+                                .text_color(theme::overlay0())
+                                .child(SharedString::from(format!(
+                                    "{n} file{} excluded",
+                                    if n == 1 { "" } else { "s" }
+                                ))),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .key_context("FileTree")
+                            .track_focus(&self.tree_focus)
+                            .on_action(cx.listener(|this, _: &TreeUp, _, cx| this.tree_move(-1, cx)))
+                            .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.tree_move(1, cx)))
+                            .on_action(cx.listener(|this, _: &TreeOpen, window, cx| {
+                                this.tree_activate(None, window, cx)
+                            }))
+                            .on_action(cx.listener(|this, _: &TreeCollapse, window, cx| {
+                                this.tree_activate(Some(true), window, cx)
+                            }))
+                            .on_action(cx.listener(|this, _: &TreeExpand, window, cx| {
+                                this.tree_activate(Some(false), window, cx)
+                            }))
+                            .on_action(cx.listener(|this, _: &FocusDiff, window, cx| {
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            }))
+                            .child(tree_list),
+                    ),
             )
     }
 
@@ -1664,8 +2314,12 @@ impl ReviewApp {
             ("[", "previous file"),
             ("n", "next hunk"),
             ("p", "previous hunk"),
+            ("down", "scroll hunk / next hunk"),
+            ("up", "scroll hunk / previous hunk"),
             ("v", "unified / split"),
             ("/", "filter files"),
+            ("ctrl-f", "filter files"),
+            ("escape", "switch file tree / diff"),
             ("home", "top"),
             ("end", "bottom"),
             ("ctrl-b", "toggle sidebar"),
@@ -1727,7 +2381,6 @@ impl ReviewApp {
 
 impl Render for ReviewApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let cell_width = self.split_cell_width(window);
         let entity = cx.entity();
         let pane: gpui::AnyElement = match &self.state {
             LoadState::Loading => centered_message("loading…".into(), theme::overlay0()),
@@ -1748,6 +2401,8 @@ impl Render for ReviewApp {
                 let rows_len = data.rows.len();
                 let widest_row_ix = data.widest_row_ix;
                 let scroll = data.scroll.clone();
+                let split_x = px(data.split_scroll_x);
+                let is_split = data.mode == ViewMode::Split;
                 div()
                     .size_full()
                     .relative()
@@ -1789,6 +2444,23 @@ impl Render for ReviewApp {
                             }
                         }
                     }))
+                    .when(is_split, |pane| {
+                        pane.on_scroll_wheel(cx.listener(
+                            |this, event: &ScrollWheelEvent, window, cx| {
+                                let delta = event.delta.pixel_delta(px(row_height()));
+                                let dx = if delta.x != px(0.) {
+                                    delta.x
+                                } else if event.modifiers.shift {
+                                    delta.y
+                                } else {
+                                    return;
+                                };
+                                if this.scroll_split_x(f32::from(dx), window) {
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                    })
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseUpEvent, _, _| {
@@ -1807,6 +2479,7 @@ impl Render for ReviewApp {
                             match this.active_data() {
                                 Some(data) => {
                                     let sel = data.selection;
+                                    let hunk = data.current_hunk().map(|(_, start, end)| start..end);
                                     range
                                         .filter_map(|ix| data.rows.get(ix).map(|row| (ix, row)))
                                         .map(|(ix, row)| {
@@ -1815,7 +2488,24 @@ impl Render for ReviewApp {
                                                     .filter(|range| !range.is_empty())
                                                     .map(|range| (sel.side, range))
                                             });
-                                            render_row(row, row_sel, cell_width)
+                                            let el = render_row(row, row_sel, split_x);
+                                            if hunk.as_ref().is_some_and(|h| h.contains(&ix)) {
+                                                div()
+                                                    .relative()
+                                                    .child(el)
+                                                    .child(
+                                                        div()
+                                                            .absolute()
+                                                            .left_0()
+                                                            .top_0()
+                                                            .bottom_0()
+                                                            .w(px(3.))
+                                                            .bg(theme::blue()),
+                                                    )
+                                                    .into_any_element()
+                                            } else {
+                                                el
+                                            }
                                         })
                                         .collect()
                                 }
@@ -1889,6 +2579,8 @@ impl Render for ReviewApp {
                     .unwrap_or_default();
                 this.jump_prev(&targets, cx)
             }))
+            .on_action(cx.listener(|this, _: &HunkDown, _, cx| this.step_hunk(true, cx)))
+            .on_action(cx.listener(|this, _: &HunkUp, _, cx| this.step_hunk(false, cx)))
             .on_action(cx.listener(|this, _: &GoToTop, _, cx| this.jump(0, cx)))
             .on_action(cx.listener(|this, _: &GoToBottom, _, cx| {
                 if let Some(last) = this.active_data().map(|d| d.rows.len().saturating_sub(1)) {
@@ -1897,7 +2589,9 @@ impl Render for ReviewApp {
             }))
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
-            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+            // Escape in the diff: close the keybindings panel, else clear the
+            // selection, else move focus to the sidebar's file tree.
+            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
                 if this.keybindings_visible {
                     this.keybindings_visible = false;
                     cx.notify();
@@ -1906,8 +2600,10 @@ impl Render for ReviewApp {
                 if let Some(data) = this.active_data_mut() {
                     if data.selection.take().is_some() {
                         cx.notify();
+                        return;
                     }
                 }
+                this.focus_tree(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
                 let Some(data) = this.active_data() else {
@@ -1945,7 +2641,7 @@ impl Render for ReviewApp {
                     .min_h_0()
                     .flex()
                     .when(self.sidebar_visible, |main| {
-                        main.child(self.render_sidebar(cx))
+                        main.child(self.render_sidebar(window, cx))
                             .child(self.render_sidebar_resizer(cx))
                     })
                     .child(
@@ -1984,11 +2680,20 @@ fn main() {
                 KeyBinding::new("[", PrevFile, Some("ReviewApp")),
                 KeyBinding::new("n", NextHunk, Some("ReviewApp")),
                 KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
+                KeyBinding::new("down", HunkDown, Some("ReviewApp")),
+                KeyBinding::new("up", HunkUp, Some("ReviewApp")),
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
                 KeyBinding::new("/", FocusTreeFilter, Some("ReviewApp")),
+                KeyBinding::new("ctrl-f", FocusTreeFilter, None),
+                KeyBinding::new("up", TreeUp, Some("FileTree")),
+                KeyBinding::new("down", TreeDown, Some("FileTree")),
+                KeyBinding::new("enter", TreeOpen, Some("FileTree")),
+                KeyBinding::new("left", TreeCollapse, Some("FileTree")),
+                KeyBinding::new("right", TreeExpand, Some("FileTree")),
+                KeyBinding::new("escape", FocusDiff, Some("FileTree")),
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
                 KeyBinding::new("ctrl-c", CopySelection, Some("ReviewApp")),
                 KeyBinding::new("ctrl-=", ZoomIn, None),
@@ -2030,6 +2735,35 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relevant_changes() {
+        use super::is_relevant_change as rel;
+        use std::path::Path;
+        let root = Path::new("/r");
+        assert!(rel(root, Path::new("/r/src/a.rs")));
+        assert!(rel(root, Path::new("/r/.git/HEAD")));
+        assert!(rel(root, Path::new("/r/.git/refs/heads/main")));
+        assert!(!rel(root, Path::new("/r/.git/index")));
+        assert!(!rel(root, Path::new("/r/.git/objects/ab/cd")));
+        assert!(!rel(root, Path::new("/r/web/node_modules/x/y.js")));
+        assert!(!rel(root, Path::new("/r/target/debug/foo")));
+        assert!(!rel(root, Path::new("/elsewhere/a.rs")));
+    }
+
+    #[test]
+    fn exclude_patterns() {
+        use super::path_excluded as ex;
+        for pat in ["__generated__", "*/__generated__/*", "__generated__/", "./__generated__"] {
+            assert!(ex(pat, "__generated__/a.ts"), "{pat}");
+            assert!(ex(pat, "src/x/__generated__/a.ts"), "{pat}");
+            assert!(!ex(pat, "src/generated/a.ts"), "{pat}");
+        }
+        assert!(ex("*.snap", "tests/__snapshots__/a.snap"));
+        assert!(ex("src/gen", "src/gen/a.rs"));
+        assert!(!ex("src/gen", "lib/src/gener/a.rs"));
+        assert!(!ex("", "a.rs"));
+    }
+
     use super::*;
     use diff_core::Hunk;
 
@@ -2073,7 +2807,7 @@ mod tests {
         let diff = PrDiff {
             files: vec![file("a.rs", vec![hunk(vec![rem(1, "a"), add(1, "b")])])],
         };
-        let (rows, file_rows, hunk_rows) = build_rows(&diff, ViewMode::Unified);
+        let (rows, file_rows, hunk_rows) = build_rows(&diff, ViewMode::Unified, None);
         assert_eq!(file_rows, vec![0]);
         assert_eq!(hunk_rows, vec![1]);
         assert!(matches!(rows[0], Row::FileHeader { .. }));
@@ -2091,7 +2825,7 @@ mod tests {
                 vec![hunk(vec![rem(1, "a"), rem(2, "b"), add(1, "c"), add(2, "d")])],
             )],
         };
-        let (rows, _, _) = build_rows(&diff, ViewMode::Split);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Split, None);
         assert_eq!(rows.len(), 4);
         assert!(matches!(&rows[2], Row::SplitLine { left: Some(_), right: Some(_) }));
         assert!(matches!(&rows[3], Row::SplitLine { left: Some(_), right: Some(_) }));

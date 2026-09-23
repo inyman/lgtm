@@ -225,6 +225,44 @@ pub fn diff_patch(src: &LocalSource) -> Result<String> {
     Ok(patch)
 }
 
+/// Whether any of `paths` (inside `repo_root`) is not gitignored — i.e. a
+/// change there could show up in the diff. Errs toward `true` if git fails.
+pub fn any_unignored(repo_root: &Path, paths: &[PathBuf]) -> bool {
+    use std::io::Write;
+    use std::process::Stdio;
+    if paths.is_empty() {
+        return false;
+    }
+    let child = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["check-ignore", "--stdin", "-z"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return true;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        for path in paths {
+            let _ = stdin.write_all(path.as_os_str().as_encoded_bytes());
+            let _ = stdin.write_all(b"\0");
+        }
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return true;
+    };
+    // Exit 1 means none were ignored; anything but 0/1 is an error.
+    match output.status.code() {
+        Some(0) => {
+            let ignored = output.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()).count();
+            ignored < paths.len()
+        }
+        _ => true,
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -247,6 +285,20 @@ mod tests {
     use super::*;
     use diff_core::FileStatus;
     use std::fs;
+
+    #[test]
+    fn any_unignored_respects_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_repo(&dir);
+        fs::write(dir.join(".gitignore"), "dist/\n").unwrap();
+        fs::create_dir_all(dir.join("dist")).unwrap();
+        let dist = dir.join("dist/a.js");
+        let src = dir.join("src.rs");
+        assert!(!any_unignored(&dir, &[dist.clone()]));
+        assert!(any_unignored(&dir, &[dist, src]));
+        assert!(!any_unignored(&dir, &[]));
+    }
 
     fn run(dir: &Path, args: &[&str]) {
         let output = Command::new(args[0])
