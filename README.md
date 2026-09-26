@@ -51,7 +51,6 @@ cargo run --release -- /path/to/repo
 - buckets: path patterns (`docs/context`, `*.glb`, `__generated__`) sort changed files into
   named groups you commit one group at a time; mark-as-viewed moves a file out of the way
 - `z` opens the file in [Zed](https://zed.dev) at the line you're on
-- mouse selection + copy
 - colors follow the active [Omarchy](https://omarchy.org) theme when present, else Catppuccin Mocha
 
 ## Reviewing
@@ -157,7 +156,7 @@ Zed's CLI is `zed`, which lgtm doesn't call yet).
 | `r` | refresh |
 | `ctrl-b` | toggle sidebar |
 | `ctrl-+` / `ctrl--` / `ctrl-0` | diff font size: bigger / smaller / reset |
-| `ctrl-c` | copy selection |
+| `ctrl-c` | into the commit message box (`esc` back to the diff) |
 | `ctrl-enter` | commit (in the commit box) |
 | `ctrl-k` | show keybindings |
 | `ctrl-q` | quit |

@@ -83,7 +83,7 @@ actions!(
         ToggleSidebar,
         Refresh,
         ClearSelection,
-        CopySelection,
+        FocusCommit,
         FocusTreeFilter,
         ZoomIn,
         ZoomOut,
@@ -1196,18 +1196,6 @@ fn row_selection_range(sel: &Selection, row_ix: usize, row: &Row) -> Option<Rang
         return None;
     }
     Some(char_to_byte(text, start_col)..char_to_byte(text, end_col))
-}
-
-fn selection_text(sel: &Selection, rows: &[Row]) -> String {
-    let (start, end) = sel.ordered();
-    let mut parts = Vec::new();
-    for (ix, row) in rows.iter().enumerate().take(end.row + 1).skip(start.row) {
-        if let Some(range) = row_selection_range(sel, ix, row) {
-            let text = row_side_text(row, sel.side).unwrap_or_default();
-            parts.push(&text[range]);
-        }
-    }
-    parts.join("\n")
 }
 
 // --- Item data ------------------------------------------------------------
@@ -3957,7 +3945,7 @@ impl ReviewApp {
             ("ctrl-=", "bigger font"),
             ("ctrl--", "smaller font"),
             ("ctrl-0", "reset font"),
-            ("ctrl-c", "copy selection"),
+            ("ctrl-c", "commit message box"),
             ("enter", "comment on hunk / selected lines"),
             ("c", "copy review report (selected bucket)"),
             ("x", "clear review report (selected bucket)"),
@@ -4326,17 +4314,12 @@ impl Render for ReviewApp {
                     }
                 }
             }))
-            .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
-                let Some(data) = this.active_data() else {
-                    return;
-                };
-                let Some(sel) = data.selection else {
-                    return;
-                };
-                let text = selection_text(&sel, &data.rows);
-                if !text.is_empty() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
+            // ctrl-c: into the commit message box (escape comes back).
+            .on_action(cx.listener(|this, _: &FocusCommit, window, cx| {
+                this.sidebar_visible = true;
+                this.commit_input
+                    .update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
             }))
             .on_action(
                 cx.listener(|this, _: &EditComment, window, cx| this.open_comment(window, cx)),
@@ -4452,7 +4435,8 @@ fn main() {
                 KeyBinding::new("z", OpenInEditor, Some("ReviewApp")),
                 KeyBinding::new("z", OpenInEditor, Some("FileTree")),
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
-                KeyBinding::new("ctrl-c", CopySelection, Some("ReviewApp")),
+                KeyBinding::new("ctrl-c", FocusCommit, Some("ReviewApp")),
+                KeyBinding::new("ctrl-c", FocusCommit, Some("FileTree")),
                 KeyBinding::new("enter", EditComment, Some("ReviewApp")),
                 KeyBinding::new("c", CopyReview, Some("ReviewApp")),
                 KeyBinding::new("x", ClearReview, Some("ReviewApp")),
