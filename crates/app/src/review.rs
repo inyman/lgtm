@@ -109,8 +109,9 @@ impl Review {
         self.save();
     }
 
-    pub fn clear(&mut self) {
-        self.comments.clear();
+    /// Drops the comments on files `pick` accepts.
+    pub fn clear_where(&mut self, pick: impl Fn(&str) -> bool) {
+        self.comments.retain(|c| !pick(&c.path));
         self.save();
     }
 
@@ -130,8 +131,14 @@ impl Review {
     /// The report for the agent: numbered comments, each with its location,
     /// the diff lines it's about, and the note.
     pub fn to_markdown(&self) -> String {
+        self.to_markdown_where(|_| true)
+    }
+
+    /// The report for just the comments on files `pick` accepts.
+    pub fn to_markdown_where(&self, pick: impl Fn(&str) -> bool) -> String {
         let mut out = String::new();
-        for (i, c) in self.comments.iter().enumerate() {
+        let picked = self.comments.iter().filter(|c| pick(&c.path));
+        for (i, c) in picked.enumerate() {
             if i > 0 {
                 out.push('\n');
             }
@@ -202,6 +209,7 @@ mod tests {
             ),
             None
         );
+        assert_eq!(r.to_markdown_where(|p| p == "b.rs"), "1. b.rs:1-2\n\nx\n");
         r.set(ix, comment("b.rs", Side::New, 1, 2, "  "));
         assert_eq!(r.comments.len(), 1);
         assert!(r.to_markdown() == "1. a.rs:9\n\ny\n");

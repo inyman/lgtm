@@ -24,6 +24,10 @@ pub struct Buckets {
     pub names: Vec<String>,
     /// Path → bucket name.
     pub files: BTreeMap<String, String>,
+    /// Path → fingerprint of its diff when last sorted (or looked at), to
+    /// flag files that changed since.
+    #[serde(default)]
+    pub sorted: BTreeMap<String, u64>,
     #[serde(skip)]
     file: Option<PathBuf>,
 }
@@ -76,25 +80,59 @@ impl Buckets {
     /// Removes a bucket; its files go back to Default.
     pub fn delete(&mut self, name: &str) {
         self.names.retain(|n| n != name);
-        self.files.retain(|_, bucket| bucket != name);
+        let files = &mut self.files;
+        self.sorted
+            .retain(|path, _| files.get(path).is_some_and(|b| b != name));
+        files.retain(|_, bucket| bucket != name);
         self.save();
     }
 
-    /// Puts `paths` in bucket `name` (None: back to Default).
-    pub fn assign<'a>(&mut self, paths: impl IntoIterator<Item = &'a str>, name: Option<&str>) {
-        for path in paths {
+    /// Puts `files` (path, diff fingerprint) in bucket `name` (None: back
+    /// to Default).
+    pub fn assign<'a>(
+        &mut self,
+        files: impl IntoIterator<Item = (&'a str, u64)>,
+        name: Option<&str>,
+    ) {
+        for (path, hash) in files {
             match name {
-                Some(name) => self.files.insert(path.to_string(), name.to_string()),
-                None => self.files.remove(path),
-            };
+                Some(name) => {
+                    self.files.insert(path.to_string(), name.to_string());
+                    self.sorted.insert(path.to_string(), hash);
+                }
+                None => {
+                    self.files.remove(path);
+                    self.sorted.remove(path);
+                }
+            }
         }
         self.save();
+    }
+
+    /// Records that a bucketed file was looked at in its current state,
+    /// clearing its "changed since sorted" mark.
+    pub fn seen<'a>(&mut self, files: impl IntoIterator<Item = (&'a str, u64)>) {
+        let mut changed = false;
+        for (path, hash) in files {
+            if self.bucket_of(path).is_some() {
+                changed |= self.sorted.insert(path.to_string(), hash) != Some(hash);
+            }
+        }
+        if changed {
+            self.save();
+        }
+    }
+
+    /// Whether a bucketed file's diff changed since it was sorted.
+    pub fn changed_since_sorted(&self, path: &str, hash: u64) -> bool {
+        self.bucket_of(path).is_some() && self.sorted.get(path).is_some_and(|h| *h != hash)
     }
 
     /// Drops assignments for `paths`, e.g. once they're committed.
     pub fn forget<'a>(&mut self, paths: impl IntoIterator<Item = &'a str>) {
         for path in paths {
             self.files.remove(path);
+            self.sorted.remove(path);
         }
         self.save();
     }
@@ -123,7 +161,12 @@ mod tests {
         assert!(!b.create("change 1"));
         assert!(!b.create(" Default "));
         assert!(!b.create(""));
-        b.assign(["a.rs", "b.rs"], Some("change 1"));
+        b.assign([("a.rs", 1), ("b.rs", 2)], Some("change 1"));
+        assert!(!b.changed_since_sorted("a.rs", 1));
+        assert!(b.changed_since_sorted("a.rs", 7));
+        b.seen([("a.rs", 7), ("c.rs", 3)]);
+        assert!(!b.changed_since_sorted("a.rs", 7));
+        assert!(!b.sorted.contains_key("c.rs"));
         let one = Selected::Named("change 1".into());
         assert!(b.contains(&one, "a.rs", false));
         assert!(!b.contains(&Selected::Default, "a.rs", false));
@@ -134,10 +177,12 @@ mod tests {
         assert!(!b.contains(&Selected::All, "a.rs", true));
         assert!(b.contains(&Selected::Filtered, "a.rs", true));
         assert!(!b.contains(&Selected::Filtered, "c.rs", false));
-        b.assign(["b.rs"], None);
+        b.assign([("b.rs", 2)], None);
+        assert!(!b.changed_since_sorted("b.rs", 9));
         assert!(b.contains(&Selected::Default, "b.rs", false));
         b.delete("change 1");
         assert!(b.contains(&Selected::Default, "a.rs", false));
         assert!(b.files.is_empty());
+        assert!(b.sorted.is_empty());
     }
 }

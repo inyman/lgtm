@@ -968,12 +968,18 @@ enum TreeListRow {
     FilteredFile(usize),
 }
 
+/// Marks a file (or bucket holding one) that changed since it was sorted.
+fn changed_dot() -> gpui::Div {
+    div().flex_shrink_0().text_color(theme::peach()).child("●")
+}
+
 fn render_tree_row(
     row: TreeListRow,
     pos: usize,
     current: bool,
     cursor: bool,
     data: &ItemData,
+    changed: &HashSet<usize>,
     entity: &gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
     let stats = |file: &FileDiff| {
@@ -1069,6 +1075,7 @@ fn render_tree_row(
                                 .text_color(status_style(file.status).1)
                                 .child(entry.name.clone()),
                         )
+                        .when(changed.contains(file_ix), |row| row.child(changed_dot()))
                         .child(stats(file))
                         .child(viewed_button(*file_ix))
                         .into_any_element()
@@ -1089,6 +1096,7 @@ fn render_tree_row(
                         .text_color(status_style(file.status).1)
                         .child(SharedString::from(file.display_path().to_string())),
                 )
+                .when(changed.contains(&file_ix), |row| row.child(changed_dot()))
                 .child(stats(file))
                 .child(viewed_button(file_ix))
                 .into_any_element()
@@ -1341,6 +1349,8 @@ struct ItemData {
     viewed_count: usize,
     /// Each changed path's reviewed state, for commits to check against.
     states: HashMap<String, git::Expected>,
+    /// `file_hash` of each diff file.
+    hashes: Vec<u64>,
 }
 
 impl ItemData {
@@ -1563,6 +1573,7 @@ struct Loaded {
     hidden: HashSet<usize>,
     viewed_count: usize,
     states: HashMap<String, git::Expected>,
+    hashes: Vec<u64>,
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
@@ -1675,12 +1686,14 @@ fn fetch_item(
         .map(str::to_string)
         .collect();
     let states = git::worktree_state(&src.repo_root, &paths);
+    let hashes = diff.files.iter().map(file_hash).collect();
     Ok(Loaded {
         src,
         diff,
         hidden,
         viewed_count,
         states,
+        hashes,
         patch_hash,
         rows,
         file_rows,
@@ -1825,6 +1838,8 @@ struct BucketCounts {
     default: usize,
     filtered: usize,
     named: Vec<usize>,
+    /// Per named bucket: holds a file changed since it was sorted.
+    changed: Vec<bool>,
 }
 
 /// A comment being written or edited: the review entry it replaces, if any,
@@ -2018,6 +2033,7 @@ impl ReviewApp {
             hidden,
             viewed_count,
             states,
+            hashes,
             rows,
             file_rows,
             hunk_rows,
@@ -2040,6 +2056,7 @@ impl ReviewApp {
                 data.hidden = hidden;
                 data.viewed_count = viewed_count;
                 data.states = states;
+                data.hashes = hashes;
                 data.additions = additions;
                 data.deletions = deletions;
                 // Keep the viewport and cursor on the same content: changes
@@ -2077,6 +2094,7 @@ impl ReviewApp {
                     hidden,
                     viewed_count,
                     states,
+                    hashes,
                     mode,
                     rows,
                     file_rows,
@@ -2267,17 +2285,33 @@ impl ReviewApp {
     }
 
     /// How many diff files each bucket holds: (All, Default, per name).
+    /// Bucketed files whose diff changed since they were sorted.
+    fn changed_since_sorted(&self) -> HashSet<usize> {
+        let Some(data) = self.active_data() else {
+            return HashSet::new();
+        };
+        data.diff
+            .files
+            .iter()
+            .zip(&data.hashes)
+            .enumerate()
+            .filter(|(_, (f, hash))| self.buckets.changed_since_sorted(f.display_path(), **hash))
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
     /// How many diff files each bucket holds.
     fn bucket_counts(&self, cx: &App) -> BucketCounts {
         let mut counts = BucketCounts {
             named: vec![0; self.buckets.names.len()],
+            changed: vec![false; self.buckets.names.len()],
             ..Default::default()
         };
         let Some(data) = self.active_data() else {
             return counts;
         };
         let filters = self.effective_exclude(cx);
-        for f in &data.diff.files {
+        for (f, hash) in data.diff.files.iter().zip(&data.hashes) {
             let path = f.display_path();
             if is_filtered(&filters, path) {
                 counts.filtered += 1;
@@ -2288,6 +2322,7 @@ impl ReviewApp {
                 Some(name) => {
                     if let Some(i) = self.buckets.names.iter().position(|n| n == name) {
                         counts.named[i] += 1;
+                        counts.changed[i] |= self.buckets.changed_since_sorted(path, *hash);
                     }
                 }
                 None => counts.default += 1,
@@ -2302,6 +2337,7 @@ impl ReviewApp {
         }
         self.selected = selected;
         self.commit_status = None;
+        self.review_copied = false;
         self.apply_viewed(cx);
         self.tree_cursor = 0;
         if let Some(data) = self.active_data() {
@@ -2391,8 +2427,23 @@ impl ReviewApp {
         let Some(paths) = self.moving.take() else {
             return;
         };
-        self.buckets
-            .assign(paths.iter().map(String::as_str), name.as_deref());
+        let files: Vec<(&str, u64)> = match self.active_data() {
+            Some(data) => paths
+                .iter()
+                .map(|path| {
+                    let hash = data
+                        .diff
+                        .files
+                        .iter()
+                        .position(|f| f.display_path() == path)
+                        .and_then(|ix| data.hashes.get(ix).copied())
+                        .unwrap_or_default();
+                    (path.as_str(), hash)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        self.buckets.assign(files, name.as_deref());
         window.focus(&self.focus_handle);
         let last = self.active_data().and_then(|data| {
             data.diff
@@ -2529,6 +2580,7 @@ impl ReviewApp {
             default,
             filtered,
             named,
+            changed,
         } = self.bucket_counts(cx);
         let tab = |id: SharedString, label: String, n: Option<usize>, selected: bool| {
             div()
@@ -2592,7 +2644,8 @@ impl ReviewApp {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.select_bucket(Selected::Named(pick.clone()), cx)
-            }));
+            }))
+            .when(changed[i], |t| t.child(changed_dot()));
             if selected {
                 let name = name.clone();
                 t = t.child(
@@ -2627,12 +2680,22 @@ impl ReviewApp {
         })
     }
 
+    /// Whether a comment on `path` belongs to the selected bucket; `c` and
+    /// `x` act on those.
+    fn in_selected_bucket(&self, cx: &App) -> impl Fn(&str) -> bool + '_ {
+        let filters = self.effective_exclude(cx);
+        move |path| {
+            self.buckets
+                .contains(&self.selected, path, is_filtered(&filters, path))
+        }
+    }
+
     fn copy_review(&mut self, cx: &mut Context<Self>) {
         self.save_comment(cx);
-        if self.review.comments.is_empty() {
+        let report = self.review.to_markdown_where(self.in_selected_bucket(cx));
+        if report.is_empty() {
             return;
         }
-        let report = self.review.to_markdown();
         cx.write_to_clipboard(ClipboardItem::new_string(report));
         self.review_copied = true;
         cx.notify();
@@ -2640,7 +2703,10 @@ impl ReviewApp {
 
     fn clear_review(&mut self, cx: &mut Context<Self>) {
         self.editing = None;
-        self.review.clear();
+        let filters = self.effective_exclude(cx);
+        let (buckets, selected) = (&self.buckets, &self.selected);
+        self.review
+            .clear_where(|path| buckets.contains(selected, path, is_filtered(&filters, path)));
         self.review_copied = false;
         cx.notify();
     }
@@ -3363,6 +3429,8 @@ impl ReviewApp {
         }) else {
             return;
         };
+        self.buckets
+            .seen(entries.iter().map(|(path, hash)| (path.as_str(), *hash)));
         self.viewed.extend(entries);
         self.hide_and_move_on(last, cx);
     }
@@ -3572,6 +3640,7 @@ impl ReviewApp {
                     let Some(data) = this.active_data() else {
                         return Vec::new();
                     };
+                    let changed = this.changed_since_sorted();
                     range
                         .filter_map(|pos| tree_rows.get(pos).map(|row| (pos, *row)))
                         .map(|(pos, row)| {
@@ -3581,6 +3650,7 @@ impl ReviewApp {
                                 current_row == Some(pos),
                                 tree_focused && pos == tree_cursor,
                                 data,
+                                &changed,
                                 &entity,
                             )
                         })
@@ -3653,7 +3723,19 @@ impl ReviewApp {
                         )
                     })
                     .when(!self.review.comments.is_empty(), |col| {
-                        let n = self.review.comments.len();
+                        let here = self.in_selected_bucket(cx);
+                        let n = self
+                            .review
+                            .comments
+                            .iter()
+                            .filter(|c| here(&c.path))
+                            .count();
+                        let bucket = match &self.selected {
+                            buckets::Selected::All => String::new(),
+                            buckets::Selected::Default => " in Default".into(),
+                            buckets::Selected::Filtered => " in Filtered out".into(),
+                            buckets::Selected::Named(name) => format!(" in {name}"),
+                        };
                         let link = |id: &'static str, label: SharedString| {
                             div()
                                 .id(id)
@@ -3670,7 +3752,7 @@ impl ReviewApp {
                                 .text_size(px(16.))
                                 .text_color(theme::overlay0())
                                 .child(div().text_color(theme::peach()).child(SharedString::from(
-                                    format!("{n} comment{}", if n == 1 { "" } else { "s" }),
+                                    format!("{n} comment{}{bucket}", if n == 1 { "" } else { "s" }),
                                 )))
                                 .child(
                                     link(
@@ -3814,8 +3896,8 @@ impl ReviewApp {
             ("ctrl-0", "reset font"),
             ("ctrl-c", "copy selection"),
             ("enter", "comment on hunk / selected lines"),
-            ("c", "copy review report"),
-            ("x", "clear review report"),
+            ("c", "copy review report (selected bucket)"),
+            ("x", "clear review report (selected bucket)"),
             ("m", "move file / folder to a bucket"),
             ("ctrl-k", "keybindings"),
             ("ctrl-q", "quit"),
@@ -4397,6 +4479,7 @@ mod tests {
             hidden,
             viewed_count: 0,
             states: HashMap::new(),
+            hashes: Vec::new(),
         }
     }
 
@@ -4429,7 +4512,7 @@ mod tests {
         let data = item_with_hidden(&[]);
         let mut b = Buckets::default();
         b.create("one");
-        b.assign(["z/w.txt"], Some("one"));
+        b.assign([("z/w.txt", 0)], Some("one"));
         let viewed = HashMap::from([("a/x.txt".to_string(), file_hash(&data.diff.files[0]))]);
         let (hidden, n) = hidden_files(&data.diff, &viewed, &b, &[], &Selected::All);
         assert_eq!((hidden, n), (HashSet::from([0]), 1));

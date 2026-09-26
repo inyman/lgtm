@@ -56,7 +56,7 @@ cargo run --release -- /path/to/repo
 
 Press `enter` on a hunk, a line (`shift-down` / `shift-up`) or a mouse selection to comment on it; `esc` saves,
 an empty comment deletes. Commented hunks show the note in their `@@` header.
-`c` copies the review:
+`c` copies the review for the selected bucket's files (`x` clears them):
 
 ````markdown
 1. src/main.rs:190-200
@@ -78,7 +78,8 @@ files.
 ## Buckets and committing
 
 Tabs under the file filter show **All**, **Default** (files not sorted yet), your
-own buckets, and **Filtered out**; `+` adds a bucket. `m` moves the current file —
+own buckets, and **Filtered out**; `+` adds a bucket. A **●** marks a bucketed file
+(and its tab) that changed since you sorted it; marking it viewed clears it. `m` moves the current file —
 or the file/folder under the tree cursor — to a bucket.
 
 **Filtered out** holds every file matching its patterns (`__generated__`, `*.wasm`,
@@ -129,8 +130,8 @@ Zed's CLI is `zed`, which lgtm doesn't call yet).
 | `home` / `end` | top / bottom |
 | `v` | unified ↔ split view |
 | `enter` | comment on hunk / selected lines |
-| `c` | copy review report |
-| `x` | clear review report |
+| `c` | copy review report (selected bucket's files) |
+| `x` | clear review report (selected bucket's files) |
 | `m` | move file / folder to a bucket (`1`–`9` pick, `n` new) |
 | `space` | mark file (or folder, in the tree) viewed — hides it until it changes |
 | `z` | open in Zed at this line (`zeditor`) |
