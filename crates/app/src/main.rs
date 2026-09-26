@@ -5,25 +5,27 @@
 //! as one reviewable diff with syntax highlighting, word-level intra-line
 //! diffs, unified/split views, and a file tree.
 
+mod review;
 mod theme;
 
 use diff_core::{DiffRow, FileDiff, FileStatus, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, div, font, point, prelude::*, px, size, uniform_list, App,
-    Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
-    Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, ScrollWheelEvent,
-    MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString, StyledText, Subscription,
+    actions, div, font, point, prelude::*, px, size, uniform_list, App, Application, Bounds,
+    ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding, Keystroke,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, ScrollStrategy, ScrollWheelEvent, SharedString, StyledText, Subscription,
     TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
+    button::{Button, ButtonVariants as _},
     input::{Escape as InputEscape, Input, InputEvent, InputState},
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
-    Root, Sizable as _, TitleBar,
+    Disableable as _, Root, Sizable as _, TitleBar,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -32,7 +34,7 @@ const MONO: &str = "JetBrainsMono Nerd Font";
 
 /// Diff pane font size in px, adjustable at runtime (cmd-+ / cmd-- / cmd-0).
 static FONT_PX: AtomicU32 = AtomicU32::new(DEFAULT_TEXT_SIZE as u32);
-const DEFAULT_TEXT_SIZE: f32 = 15.0;
+const DEFAULT_TEXT_SIZE: f32 = 18.0;
 const MIN_TEXT_SIZE: f32 = 7.0;
 const MAX_TEXT_SIZE: f32 = 28.0;
 const LINE_HEIGHT_RATIO: f32 = 1.7;
@@ -70,6 +72,8 @@ actions!(
         TreeCollapse,
         TreeExpand,
         FocusDiff,
+        MarkViewed,
+        OpenInEditor,
         GoToTop,
         GoToBottom,
         ToggleView,
@@ -83,6 +87,11 @@ actions!(
         ZoomOut,
         ZoomReset,
         ToggleKeybindings,
+        EditComment,
+        ClearReview,
+        ScrollLeft,
+        ScrollRight,
+        CopyReview,
     ]
 );
 
@@ -231,14 +240,47 @@ fn widest_line(rows: &[Row]) -> (usize, usize) {
     (best_ix, best_chars)
 }
 
-/// Files matching the sidebar's "filter files…" query, or None when the
-/// query is empty (everything shown).
-fn shown_files(diff: &PrDiff, query: &str) -> Option<HashSet<usize>> {
-    if query.trim().is_empty() {
+/// Files to show in the diff: those matching the sidebar's "filter files…"
+/// query and not marked viewed. None when nothing is filtered.
+fn shown_files(diff: &PrDiff, query: &str, hidden: &HashSet<usize>) -> Option<HashSet<usize>> {
+    if query.trim().is_empty() && hidden.is_empty() {
         return None;
     }
     let paths: Vec<&str> = diff.files.iter().map(|f| f.display_path()).collect();
-    Some(fuzzy_file_matches(&paths, query).into_iter().collect())
+    Some(
+        fuzzy_file_matches(&paths, query)
+            .into_iter()
+            .filter(|ix| !hidden.contains(ix))
+            .collect(),
+    )
+}
+
+/// The new-file (working tree) line number a diff row shows, if any.
+fn row_new_line(row: &Row) -> Option<u32> {
+    match row {
+        Row::Line { new_no, .. } => *new_no,
+        Row::SplitLine { right, .. } => right.as_ref().map(|cell| cell.no),
+        _ => None,
+    }
+}
+
+/// Fingerprint of one file's diff, so a file marked viewed comes back once
+/// its changes change.
+fn file_hash(file: &FileDiff) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{file:?}").hash(&mut h);
+    h.finish()
+}
+
+/// Indices of files marked viewed whose diff hasn't changed since.
+fn viewed_files(diff: &PrDiff, viewed: &HashMap<String, u64>) -> HashSet<usize> {
+    diff.files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| viewed.get(f.display_path()) == Some(&file_hash(f)))
+        .map(|(ix, _)| ix)
+        .collect()
 }
 
 /// `only` limits the rows to those files. `file_rows` still has one entry
@@ -540,7 +582,39 @@ fn line_content(
 
 /// `split_x` is the horizontal text scroll shared by both split cells; the
 /// cells themselves stay pinned to half the pane so both sides are visible.
-fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>, split_x: Pixels) -> gpui::AnyElement {
+/// A hunk's `@@` line, with the first line of its review comment if any.
+fn render_hunk_header(label: &SharedString, note: Option<&str>) -> gpui::AnyElement {
+    div()
+        .h(px(row_height()))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_4()
+        .px_3()
+        .bg(theme::crust())
+        .text_color(theme::overlay0())
+        .child(label.clone())
+        .when_some(note, |row, note| {
+            let first = note.lines().next().unwrap_or_default();
+            let more = if note.lines().nth(1).is_some() {
+                " …"
+            } else {
+                ""
+            };
+            row.child(
+                div()
+                    .text_color(theme::peach())
+                    .child(SharedString::from(format!("\u{f075} {first}{more}"))),
+            )
+        })
+        .into_any_element()
+}
+
+fn render_row(
+    row: &Row,
+    selection: Option<(SelSide, Range<usize>)>,
+    split_x: Pixels,
+) -> gpui::AnyElement {
     let row_height = px(row_height());
     match row {
         Row::Spacer => div().h(row_height).into_any_element(),
@@ -593,16 +667,7 @@ fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>, split_x: Pi
                 )
                 .into_any_element()
         }
-        Row::HunkHeader { label } => div()
-            .h(row_height)
-            .w_full()
-            .flex()
-            .items_center()
-            .px_3()
-            .bg(theme::crust())
-            .text_color(theme::overlay0())
-            .child(label.clone())
-            .into_any_element(),
+        Row::HunkHeader { label } => render_hunk_header(label, None),
         Row::Binary => div()
             .h(row_height)
             .flex()
@@ -742,7 +807,7 @@ fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>, split_x: Pi
 
 // --- Sidebar file tree ---------------------------------------------------
 
-const TREE_ROW_HEIGHT: f32 = 28.0;
+const TREE_ROW_HEIGHT: f32 = 36.0;
 
 #[derive(Debug, PartialEq)]
 struct TreeEntry {
@@ -878,7 +943,7 @@ fn render_tree_row(
             .items_center()
             .gap_1()
             .flex_shrink_0()
-            .text_size(px(12.))
+            .text_size(px(16.))
             .child(
                 div()
                     .text_color(Hsla::from(theme::green()).opacity(0.7))
@@ -889,6 +954,23 @@ fn render_tree_row(
                     .text_color(Hsla::from(theme::red()).opacity(0.7))
                     .child(SharedString::from(format!("−{}", file.deletions))),
             )
+    };
+    // Click to mark the file viewed (same as Space); stops the row's own
+    // click from jumping to the file.
+    let viewed_button = |file_ix: usize| {
+        let entity = entity.clone();
+        div()
+            .id(("viewed", pos))
+            .flex_shrink_0()
+            .px_1()
+            .rounded_sm()
+            .text_color(theme::overlay0())
+            .hover(|s| s.text_color(theme::green()).bg(theme::surface0()))
+            .child(SharedString::from("✓"))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                entity.update(cx, |this, cx| this.mark_viewed(Some(file_ix), window, cx));
+            })
     };
     let entity = entity.clone();
     let base = div()
@@ -904,7 +986,9 @@ fn render_tree_row(
         .when(!current, |row| {
             row.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
         })
-        .when(cursor, |row| row.bg(Hsla::from(theme::blue()).opacity(0.25)));
+        .when(cursor, |row| {
+            row.bg(Hsla::from(theme::blue()).opacity(0.25))
+        });
     match row {
         TreeListRow::Entry(entry_ix) => {
             let entry = &data.tree[entry_ix];
@@ -947,6 +1031,7 @@ fn render_tree_row(
                                 .child(entry.name.clone()),
                         )
                         .child(stats(file))
+                        .child(viewed_button(*file_ix))
                         .into_any_element()
                 }
             }
@@ -966,47 +1051,48 @@ fn render_tree_row(
                         .child(SharedString::from(file.display_path().to_string())),
                 )
                 .child(stats(file))
+                .child(viewed_button(file_ix))
                 .into_any_element()
         }
     }
 }
 
-    fn render_exclude_tag(
-        ix: usize,
-        pattern: SharedString,
-        entity: &gpui::Entity<ReviewApp>,
-    ) -> gpui::AnyElement {
-        let entity = entity.clone();
-        div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(theme::surface0())
-            .flex()
-            .items_center()
-            .gap_1()
-            .text_size(px(12.))
-            .max_w_full()
-            .child(
-                div()
-                    .text_color(theme::text())
-                    .truncate()
-                    .child(pattern.clone()),
-            )
-            .child(
-                div()
-                    .id(("exclude-remove", ix))
-                    .flex_shrink_0()
-                    .text_color(theme::overlay0())
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(theme::red()))
-                    .child(SharedString::from("×"))
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |this, cx| this.remove_exclude(ix, cx));
-                    }),
-            )
-            .into_any_element()
-    }
+fn render_exclude_tag(
+    ix: usize,
+    pattern: SharedString,
+    entity: &gpui::Entity<ReviewApp>,
+) -> gpui::AnyElement {
+    let entity = entity.clone();
+    div()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .bg(theme::surface0())
+        .flex()
+        .items_center()
+        .gap_1()
+        .text_size(px(16.))
+        .max_w_full()
+        .child(
+            div()
+                .text_color(theme::text())
+                .truncate()
+                .child(pattern.clone()),
+        )
+        .child(
+            div()
+                .id(("exclude-remove", ix))
+                .flex_shrink_0()
+                .text_color(theme::overlay0())
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme::red()))
+                .child(SharedString::from("×"))
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |this, cx| this.remove_exclude(ix, cx));
+                }),
+        )
+        .into_any_element()
+}
 
 // --- Selection ------------------------------------------------------------
 
@@ -1082,9 +1168,9 @@ fn row_selection_range(sel: &Selection, row_ix: usize, row: &Row) -> Option<Rang
 fn selection_text(sel: &Selection, rows: &[Row]) -> String {
     let (start, end) = sel.ordered();
     let mut parts = Vec::new();
-    for ix in start.row..=end.row.min(rows.len().saturating_sub(1)) {
-        if let Some(range) = row_selection_range(sel, ix, &rows[ix]) {
-            let text = row_side_text(&rows[ix], sel.side).unwrap_or_default();
+    for (ix, row) in rows.iter().enumerate().take(end.row + 1).skip(start.row) {
+        if let Some(range) = row_selection_range(sel, ix, row) {
+            let text = row_side_text(row, sel.side).unwrap_or_default();
             parts.push(&text[range]);
         }
     }
@@ -1092,6 +1178,88 @@ fn selection_text(sel: &Selection, rows: &[Row]) -> String {
 }
 
 // --- Item data ------------------------------------------------------------
+
+/// A row identified by content instead of index; see `ItemData::anchor_at`.
+struct RowAnchor {
+    path: SharedString,
+    /// (old, new) line numbers, for line rows.
+    lines: Option<(Option<u32>, Option<u32>)>,
+    /// Rows past the file header, the fallback when the line is gone.
+    from_file: usize,
+}
+
+/// One diff line with both numbers, in unified order (a split changed block
+/// lists its removed lines before its added ones).
+struct DiffLine {
+    kind: LineKind,
+    old: Option<u32>,
+    new: Option<u32>,
+    text: SharedString,
+}
+
+fn diff_lines(rows: &[Row]) -> Vec<DiffLine> {
+    let mut out = Vec::new();
+    let mut added = Vec::new();
+    for row in rows {
+        match row {
+            Row::Line {
+                old_no,
+                new_no,
+                kind,
+                text,
+                ..
+            } => out.push(DiffLine {
+                kind: *kind,
+                old: *old_no,
+                new: *new_no,
+                text: text.clone(),
+            }),
+            Row::SplitLine {
+                left: Some(l),
+                right: Some(r),
+            } if l.kind == LineKind::Context => {
+                out.append(&mut added);
+                out.push(DiffLine {
+                    kind: LineKind::Context,
+                    old: Some(l.no),
+                    new: Some(r.no),
+                    text: l.text.clone(),
+                });
+            }
+            Row::SplitLine { left, right } => {
+                if let Some(l) = left {
+                    out.push(DiffLine {
+                        kind: l.kind,
+                        old: Some(l.no),
+                        new: None,
+                        text: l.text.clone(),
+                    });
+                }
+                if let Some(r) = right {
+                    added.push(DiffLine {
+                        kind: r.kind,
+                        old: None,
+                        new: Some(r.no),
+                        text: r.text.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out.append(&mut added);
+    out
+}
+
+fn row_lines(row: &Row) -> Option<(Option<u32>, Option<u32>)> {
+    match row {
+        Row::Line { old_no, new_no, .. } => Some((*old_no, *new_no)),
+        Row::SplitLine { left, right } => {
+            Some((left.as_ref().map(|c| c.no), right.as_ref().map(|c| c.no)))
+        }
+        _ => None,
+    }
+}
 
 struct ItemData {
     src: git::LocalSource,
@@ -1112,6 +1280,8 @@ struct ItemData {
     collapsed: HashSet<String>,
     tree_scroll: UniformListScrollHandle,
     tree_last_file: Option<usize>,
+    /// Files marked viewed (unchanged since), hidden from diff and tree.
+    hidden: HashSet<usize>,
 }
 
 impl ItemData {
@@ -1163,9 +1333,162 @@ impl ItemData {
         (self.cursor < end).then_some((pos, start, end))
     }
 
+    /// Pins row `ix` to content (its file and line numbers) rather than its
+    /// index, so it can be found again after the rows are rebuilt.
+    fn anchor_at(&self, ix: usize) -> Option<RowAnchor> {
+        let (path, file) = self.file_of(ix)?;
+        Some(RowAnchor {
+            path,
+            lines: self.rows.get(ix).and_then(row_lines),
+            from_file: ix - file.start,
+        })
+    }
+
+    /// Where `anchor` landed in the current rows: the same line if it still
+    /// exists, else the first line past it, else the same offset into its
+    /// file. None when the file is gone.
+    fn resolve_anchor(&self, anchor: &RowAnchor) -> Option<usize> {
+        let Range { start, end } = self.file_range(&anchor.path)?;
+        let fallback = (start + anchor.from_file).min(end.saturating_sub(1));
+        let Some((old, new)) = anchor.lines else {
+            return Some(fallback);
+        };
+        let lines = (start..end).filter_map(|ix| Some((ix, row_lines(&self.rows[ix])?)));
+        let exact = lines.clone().find(|&(_, (o, n))| match new {
+            Some(new) => n == Some(new),
+            None => o == old,
+        });
+        let after = || {
+            lines.clone().find(|&(_, (o, n))| match (new, n, old, o) {
+                (Some(t), Some(n), _, _) => n >= t,
+                (None, _, Some(t), Some(o)) => o >= t,
+                _ => false,
+            })
+        };
+        Some(exact.or_else(after).map_or(fallback, |(ix, _)| ix))
+    }
+
+    /// Rows from the header at `start` up to the next file's header.
+    /// `file_rows` has an entry per diff file, and a hidden file's entry
+    /// repeats the next shown header or points past the end, so only
+    /// strictly greater entries end a file.
+    fn file_end(&self, start: usize) -> usize {
+        self.file_rows
+            .iter()
+            .copied()
+            .filter(|&f| f > start)
+            .min()
+            .unwrap_or(self.rows.len())
+            .min(self.rows.len())
+    }
+
+    /// The row range of the shown file at `path`.
+    fn file_range(&self, path: &str) -> Option<Range<usize>> {
+        let start = self.file_rows.iter().copied().find(|&f| {
+            matches!(self.rows.get(f), Some(Row::FileHeader { path: p, .. }) if p.as_ref() == path)
+        })?;
+        Some(start..self.file_end(start))
+    }
+
+    /// The file containing row `ix`: its path and row range.
+    fn file_of(&self, ix: usize) -> Option<(SharedString, Range<usize>)> {
+        let start = self.file_rows.iter().copied().filter(|&f| f <= ix).max()?;
+        match self.rows.get(start)? {
+            Row::FileHeader { path, .. } => Some((path.clone(), start..self.file_end(start))),
+            _ => None,
+        }
+    }
+
+    /// What a comment on `rows` would cover: the file, the line span, and
+    /// the diff lines as text. `side` restricts to one split side; otherwise
+    /// the span uses working-tree numbers unless only removed lines are
+    /// involved. `changed_only` leaves context lines out of the span.
+    fn comment_target(
+        &self,
+        rows: Range<usize>,
+        side: Option<review::Side>,
+        changed_only: bool,
+    ) -> Option<(SharedString, review::Span, String)> {
+        use review::Side;
+        let (path, file) = self.file_of(rows.start)?;
+        let rows = rows.start.max(file.start)..rows.end.min(file.end);
+        let lines = diff_lines(&self.rows[rows]);
+        let no = |l: &DiffLine, side| match side {
+            Side::New => l.new,
+            Side::Old => l.old,
+        };
+        let span_side = side.unwrap_or_else(|| {
+            let has_new = lines
+                .iter()
+                .any(|l| l.new.is_some() && (!changed_only || l.kind == LineKind::Added));
+            if has_new {
+                Side::New
+            } else {
+                Side::Old
+            }
+        });
+        let nos = lines
+            .iter()
+            .filter(|l| !changed_only || l.kind != LineKind::Context)
+            .filter_map(|l| no(l, span_side));
+        let start = nos.clone().min()?;
+        let end = nos.max()?;
+        const MAX_CODE_LINES: usize = 60;
+        let shown: Vec<&DiffLine> = lines
+            .iter()
+            .filter(|l| side.is_none_or(|side| no(l, side).is_some()))
+            .collect();
+        let mut code: Vec<String> = shown
+            .iter()
+            .take(MAX_CODE_LINES)
+            .map(|l| {
+                let mark = match l.kind {
+                    LineKind::Added => '+',
+                    LineKind::Removed => '-',
+                    LineKind::Context => ' ',
+                };
+                format!("{mark}{}", l.text)
+            })
+            .collect();
+        if shown.len() > MAX_CODE_LINES {
+            code.push(format!("… {} more lines", shown.len() - MAX_CODE_LINES));
+        }
+        let span = review::Span {
+            side: span_side,
+            start,
+            end,
+        };
+        Some((path, span, code.join("\n")))
+    }
+
+    /// The row showing the last line of `span` in `path`, to place the
+    /// comment editor under.
+    fn span_end_row(&self, path: &str, span: &review::Span) -> Option<usize> {
+        self.file_range(path)?.rev().find(|&ix| {
+            row_lines(&self.rows[ix]).is_some_and(|(old, new)| {
+                let no = match span.side {
+                    review::Side::New => new,
+                    review::Side::Old => old,
+                };
+                no.is_some_and(|no| (span.start..=span.end).contains(&no))
+            })
+        })
+    }
+
     fn rebuild_tree(&mut self) {
-        let paths: Vec<&str> = self.diff.files.iter().map(|f| f.display_path()).collect();
-        let tree = build_tree(&paths);
+        let shown: Vec<usize> = (0..self.diff.files.len())
+            .filter(|ix| !self.hidden.contains(ix))
+            .collect();
+        let paths: Vec<&str> = shown
+            .iter()
+            .map(|&ix| self.diff.files[ix].display_path())
+            .collect();
+        let mut tree = build_tree(&paths);
+        for entry in &mut tree {
+            if let TreeEntryKind::File { file_ix } = &mut entry.kind {
+                *file_ix = shown[*file_ix];
+            }
+        }
         self.collapsed.retain(|path| {
             tree.iter()
                 .any(|e| matches!(&e.kind, TreeEntryKind::Dir { path: p } if p == path))
@@ -1178,6 +1501,7 @@ impl ItemData {
 struct Loaded {
     src: git::LocalSource,
     diff: PrDiff,
+    hidden: HashSet<usize>,
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
@@ -1266,8 +1590,11 @@ fn fetch_item(
     mode: ViewMode,
     exclude: &[String],
     query: &str,
+    viewed: &HashMap<String, u64>,
 ) -> anyhow::Result<Loaded> {
-    let src = git::resolve_local(path)?;
+    // Uncommitted changes only: the view is a review → commit loop, so a
+    // commit clears it.
+    let src = git::resolve_local_with_base(path, Some("HEAD"))?;
     let patch = git::diff_patch(&src)?;
     let patch_hash = {
         use std::hash::{Hash, Hasher};
@@ -1277,13 +1604,19 @@ fn fetch_item(
     };
     let mut diff = diff_core::parse_patch(&patch);
     let total = diff.files.len();
-    diff.files
-        .retain(|f| !exclude.iter().any(|pat| path_excluded(pat, f.display_path())));
+    diff.files.retain(|f| {
+        !exclude
+            .iter()
+            .any(|pat| path_excluded(pat, f.display_path()))
+    });
     let excluded = total - diff.files.len();
-    let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, shown_files(&diff, query).as_ref());
+    let hidden = viewed_files(&diff, viewed);
+    let (rows, file_rows, hunk_rows) =
+        build_rows(&diff, mode, shown_files(&diff, query, &hidden).as_ref());
     Ok(Loaded {
         src,
         diff,
+        hidden,
         excluded,
         patch_hash,
         rows,
@@ -1348,11 +1681,15 @@ fn local_titlebar_content(src: &git::LocalSource, data: &ItemData) -> gpui::AnyE
                 .child(SharedString::from(format!("vs {}", src.base_label))),
         )
         .when_some(data.current_hunk(), |bar, (pos, _, _)| {
-            bar.child(div().text_color(theme::blue()).child(SharedString::from(format!(
-                "hunk {}/{}",
-                pos + 1,
-                data.hunk_rows.len()
-            ))))
+            bar.child(
+                div()
+                    .text_color(theme::blue())
+                    .child(SharedString::from(format!(
+                        "hunk {}/{}",
+                        pos + 1,
+                        data.hunk_rows.len()
+                    ))),
+            )
         })
         .into_any_element()
 }
@@ -1392,10 +1729,31 @@ struct ReviewApp {
     /// in `tree_list_rows`).
     tree_focus: FocusHandle,
     tree_cursor: usize,
+    /// Files marked viewed: path → fingerprint of its diff when marked.
+    viewed: HashMap<String, u64>,
     drag_anchor: Option<(SelSide, RowCol)>,
     char_width: Option<Pixels>,
     repo_path: PathBuf,
+    review: review::Review,
+    comment_input: gpui::Entity<InputState>,
+    /// The comment open in the inline editor.
+    editing: Option<Editing>,
+    /// The report was just copied; cleared when the review changes.
+    review_copied: bool,
+    commit_input: gpui::Entity<InputState>,
+    committing: bool,
+    /// Result of the last commit: Ok(summary) or Err(message).
+    commit_status: Option<Result<SharedString, SharedString>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A comment being written or edited: the review entry it replaces, if any,
+/// and what it's pinned to.
+struct Editing {
+    ix: Option<usize>,
+    path: SharedString,
+    span: review::Span,
+    code: String,
 }
 
 impl ReviewApp {
@@ -1405,7 +1763,42 @@ impl ReviewApp {
         let exclude_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("exclude, e.g. __generated__ (enter to pin)")
         });
+        let comment_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(3, 12)
+                .placeholder("comment on these lines… (esc to save, empty to delete)")
+        });
+        let commit_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(2, 8)
+                .placeholder("commit message (ctrl-enter to commit)")
+        });
         let _subscriptions = vec![
+            cx.subscribe_in(
+                &commit_input,
+                window,
+                |this, input, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { secondary: true } => this.commit(window, cx),
+                    // Typing a new message dismisses the last result (the
+                    // box emptying itself after a commit doesn't).
+                    InputEvent::Change
+                        if !input.read(cx).value().is_empty()
+                            && this.commit_status.take().is_some() =>
+                    {
+                        cx.notify()
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &comment_input,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { secondary: true } = event {
+                        this.close_comment(window, cx);
+                    }
+                },
+            ),
             cx.subscribe_in(
                 &tree_filter_input,
                 window,
@@ -1451,9 +1844,17 @@ impl ReviewApp {
             focus_handle: cx.focus_handle(),
             tree_focus: cx.focus_handle(),
             tree_cursor: 0,
+            viewed: HashMap::new(),
             drag_anchor: None,
             char_width: None,
             repo_path,
+            review: review::Review::default(),
+            comment_input,
+            editing: None,
+            review_copied: false,
+            commit_input,
+            committing: false,
+            commit_status: None,
             _subscriptions,
         };
         this.spawn_fetch(ViewMode::Split, cx);
@@ -1465,12 +1866,13 @@ impl ReviewApp {
         let exclude = self.effective_exclude(cx);
         self.applied_exclude = exclude.clone();
         let query = self.tree_filter_input.read(cx).value().to_string();
+        let viewed = self.viewed.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
                 .background_spawn({
                     let exclude = exclude.clone();
                     let query = query.clone();
-                    async move { fetch_item(&repo, mode, &exclude, &query) }
+                    async move { fetch_item(&repo, mode, &exclude, &query, &viewed) }
                 })
                 .await;
             this.update(cx, |app, cx| {
@@ -1491,7 +1893,7 @@ impl ReviewApp {
                             app.installed_key = key;
                             app.install(loaded, cx);
                             // The file filter changed while fetching.
-                            if app.tree_filter_input.read(cx).value().to_string() != query {
+                            if app.tree_filter_input.read(cx).value().as_ref() != query {
                                 app.apply_file_filter(cx);
                             }
                         }
@@ -1515,6 +1917,7 @@ impl ReviewApp {
         let Loaded {
             src,
             diff,
+            hidden,
             rows,
             file_rows,
             hunk_rows,
@@ -1523,6 +1926,7 @@ impl ReviewApp {
             patch_hash: _,
         } = loaded;
         if self._watcher.is_none() {
+            self.review = review::Review::load(&src.repo_root);
             self.watch_repo(src.repo_root.clone(), cx);
         }
         self.excluded_count = excluded;
@@ -1535,10 +1939,33 @@ impl ReviewApp {
             LoadState::Ready(data) => {
                 data.src = src;
                 data.diff = diff;
+                data.hidden = hidden;
                 data.additions = additions;
                 data.deletions = deletions;
+                // Keep the viewport and cursor on the same content: changes
+                // above them shift row indices, which would make the view jump.
+                let rh = row_height();
+                let handle = data.scroll.0.borrow().base_handle.clone();
+                let offset = handle.offset();
+                let top_px = (-f32::from(offset.y)).max(0.);
+                let top_ix = (top_px / rh) as usize;
+                let top_anchor = data.anchor_at(top_ix);
+                let cursor_anchor = data.anchor_at(data.cursor);
+                let (old_top, old_cursor) = (top_ix, data.cursor);
                 data.set_rows((rows, file_rows, hunk_rows));
-                data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
+                let last = data.rows.len().saturating_sub(1);
+                let new_top = top_anchor
+                    .and_then(|a| data.resolve_anchor(&a))
+                    .unwrap_or(old_top)
+                    .min(last);
+                if new_top != old_top && data.scroll.0.borrow().deferred_scroll_to_item.is_none() {
+                    let frac = top_px - old_top as f32 * rh;
+                    handle.set_offset(point(offset.x, px(-(new_top as f32 * rh + frac))));
+                }
+                data.cursor = cursor_anchor
+                    .and_then(|a| data.resolve_anchor(&a))
+                    .unwrap_or(old_cursor)
+                    .min(last);
                 data.selection = None;
                 data.rebuild_tree();
             }
@@ -1547,6 +1974,7 @@ impl ReviewApp {
                 let mut data = Box::new(ItemData {
                     src,
                     diff,
+                    hidden,
                     mode,
                     rows,
                     file_rows,
@@ -1568,6 +1996,211 @@ impl ReviewApp {
                 self.state = LoadState::Ready(data);
             }
         }
+    }
+
+    /// Opens the inline editor on the selected lines, else on the cursor's
+    /// hunk, showing the comment already there if any.
+    fn open_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_comment(cx);
+        let Some(data) = self.active_data() else {
+            return;
+        };
+        let target = match data.selection {
+            Some(sel) => {
+                let (from, to) = sel.ordered();
+                let side = match sel.side {
+                    SelSide::Left => Some(review::Side::Old),
+                    SelSide::Right => Some(review::Side::New),
+                    SelSide::Unified => None,
+                };
+                data.comment_target(from.row..to.row + 1, side, false)
+            }
+            None => data
+                .current_hunk()
+                .and_then(|(_, start, end)| data.comment_target(start..end, None, true)),
+        };
+        let Some((path, mut span, mut code)) = target else {
+            return;
+        };
+        let ix = self.review.find(&path, &span);
+        let body = match ix.map(|ix| &self.review.comments[ix]) {
+            Some(existing) => {
+                // Opening from the hunk keeps a narrower comment's own lines.
+                if data.selection.is_none() {
+                    span = existing.span;
+                    code = existing.code.clone();
+                }
+                existing.body.clone()
+            }
+            None => String::new(),
+        };
+        self.editing = Some(Editing {
+            ix,
+            path,
+            span,
+            code,
+        });
+        self.comment_input.update(cx, |input, cx| {
+            input.set_value(body, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Saves the open comment (an empty one is deleted) and returns focus to
+    /// the diff.
+    fn close_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.save_comment(cx) {
+            return;
+        }
+        if let Some(data) = self.active_data_mut() {
+            data.selection = None;
+        }
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Stores the open comment and closes the editor; false if none was open.
+    fn save_comment(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(Editing {
+            ix,
+            path,
+            span,
+            code,
+        }) = self.editing.take()
+        else {
+            return false;
+        };
+        let body = self.comment_input.read(cx).value().trim().to_string();
+        self.review.set(
+            ix,
+            review::Comment {
+                path: path.to_string(),
+                span,
+                body,
+                code,
+            },
+        );
+        self.review_copied = false;
+        true
+    }
+
+    /// Stages everything and commits it with the message box's text.
+    fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let message = self.commit_input.read(cx).value().trim().to_string();
+        if message.is_empty() || self.committing {
+            return;
+        }
+        let Some(root) = self.active_data().map(|data| data.src.repo_root.clone()) else {
+            return;
+        };
+        self.committing = true;
+        self.commit_status = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { git::commit_all(&root, &message) })
+                .await;
+            this.update_in(cx, |app, window, cx| {
+                app.committing = false;
+                match result {
+                    Ok(summary) => {
+                        app.commit_status = Some(Ok(summary.into()));
+                        // The comments were about what just got committed.
+                        app.review.clear();
+                        app.editing = None;
+                        app.review_copied = false;
+                        app.commit_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        app.refresh(cx);
+                    }
+                    Err(err) => app.commit_status = Some(Err(format!("{err:#}").into())),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn copy_review(&mut self, cx: &mut Context<Self>) {
+        self.save_comment(cx);
+        if self.review.comments.is_empty() {
+            return;
+        }
+        let report = self.review.to_markdown();
+        cx.write_to_clipboard(ClipboardItem::new_string(report));
+        self.review_copied = true;
+        cx.notify();
+    }
+
+    fn clear_review(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.review.clear();
+        self.review_copied = false;
+        cx.notify();
+    }
+
+    /// The inline comment editor, floated under the lines it's about.
+    fn render_comment_editor(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let editing = self.editing.as_ref()?;
+        let data = self.active_data()?;
+        let rh = row_height();
+        let handle = data.scroll.0.borrow().base_handle.clone();
+        let viewport = f32::from(handle.bounds().size.height);
+        let row = data
+            .span_end_row(&editing.path, &editing.span)
+            .unwrap_or(data.cursor);
+        const EDITOR_H: f32 = 260.;
+        let top = ((row + 1) as f32 * rh + f32::from(handle.offset().y))
+            .min(viewport - EDITOR_H)
+            .max(0.);
+        let is_new = editing.ix.is_none();
+        Some(
+            div()
+                .absolute()
+                .top(px(top))
+                .left(px(48.))
+                .right(px(24.))
+                .max_w(px(760.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .bg(theme::mantle())
+                .border_1()
+                .border_color(theme::peach())
+                .rounded(px(6.))
+                .shadow_lg()
+                .text_size(px(13.))
+                .on_action(
+                    cx.listener(|this, _: &InputEscape, window, cx| this.close_comment(window, cx)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_color(theme::overlay0())
+                        .child(SharedString::from(format!(
+                            "{} {}",
+                            if is_new {
+                                "new comment ·"
+                            } else {
+                                "comment ·"
+                            },
+                            review::Comment {
+                                path: editing.path.to_string(),
+                                span: editing.span,
+                                body: String::new(),
+                                code: String::new(),
+                            }
+                            .location()
+                        )))
+                        .child("esc / ctrl-enter save"),
+                )
+                .child(Input::new(&self.comment_input))
+                .into_any_element(),
+        )
     }
 
     fn active_data(&self) -> Option<&ItemData> {
@@ -1633,6 +2266,30 @@ impl ReviewApp {
         let changed = x != data.split_scroll_x;
         data.split_scroll_x = x;
         changed
+    }
+
+    /// Left/right keys: scroll the diff text sideways by a few characters,
+    /// when it's wider than the pane.
+    fn scroll_x_by_key(&mut self, right: bool, window: &Window, cx: &mut Context<Self>) {
+        let step = f32::from(self.char_width(window)) * 8.;
+        let delta = if right { -step } else { step };
+        let Some(data) = self.active_data() else {
+            return;
+        };
+        if data.mode == ViewMode::Split {
+            if self.scroll_split_x(delta, window) {
+                cx.notify();
+            }
+            return;
+        }
+        let handle = data.scroll.0.borrow().base_handle.clone();
+        let offset = handle.offset();
+        let max = f32::from(handle.max_offset().width);
+        let x = (f32::from(offset.x) + delta).clamp(-max, 0.);
+        if x != f32::from(offset.x) {
+            handle.set_offset(point(px(x), offset.y));
+            cx.notify();
+        }
     }
 
     fn pane_hit(
@@ -1776,7 +2433,11 @@ impl ReviewApp {
     fn apply_file_filter(&mut self, cx: &mut Context<Self>) {
         let query = self.tree_filter_input.read(cx).value().to_string();
         if let Some(data) = self.active_data_mut() {
-            data.set_rows(build_rows(&data.diff, data.mode, shown_files(&data.diff, &query).as_ref()));
+            data.set_rows(build_rows(
+                &data.diff,
+                data.mode,
+                shown_files(&data.diff, &query, &data.hidden).as_ref(),
+            ));
             data.selection = None;
         }
         self.jump(0, cx);
@@ -1793,7 +2454,11 @@ impl ReviewApp {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
         };
-        data.set_rows(build_rows(&data.diff, data.mode, shown_files(&data.diff, &query).as_ref()));
+        data.set_rows(build_rows(
+            &data.diff,
+            data.mode,
+            shown_files(&data.diff, &query, &data.hidden).as_ref(),
+        ));
         let target = file_pos
             .and_then(|pos| data.file_rows.get(pos).copied())
             .unwrap_or(0);
@@ -1810,9 +2475,7 @@ impl ReviewApp {
             let handle = data.scroll.0.borrow().base_handle.clone();
             let viewport = f32::from(handle.bounds().size.height);
             match data.current_hunk() {
-                Some((_, start, end))
-                    if viewport > 0. && (end - start) as f32 * rh < viewport =>
-                {
+                Some((_, start, end)) if viewport > 0. && (end - start) as f32 * rh < viewport => {
                     let block = (end - start) as f32 * rh;
                     let max = (data.rows.len() as f32 * rh - viewport).max(0.);
                     let top = (start as f32 * rh - (viewport - block) / 2.).clamp(0., max);
@@ -1992,22 +2655,31 @@ impl ReviewApp {
             .border_color(theme::surface0())
             .bg(theme::mantle())
             .text_size(px(13.))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                this.titlebar_dragging = true;
-                cx.stop_propagation();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.titlebar_dragging = true;
+                    cx.stop_propagation();
+                }),
+            )
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, window, _| {
                 if this.titlebar_dragging {
                     this.titlebar_dragging = false;
                     window.start_window_move();
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| {
-                this.titlebar_dragging = false;
-            }))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| {
-                this.titlebar_dragging = false;
-            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                    this.titlebar_dragging = false;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                    this.titlebar_dragging = false;
+                }),
+            )
             .child(content)
             .when_some(note, |bar, note| {
                 bar.child(
@@ -2037,6 +2709,7 @@ impl ReviewApp {
             let paths: Vec<&str> = data.diff.files.iter().map(|f| f.display_path()).collect();
             fuzzy_file_matches(&paths, &query)
                 .into_iter()
+                .filter(|ix| !data.hidden.contains(ix))
                 .map(TreeListRow::FilteredFile)
                 .collect()
         }
@@ -2059,12 +2732,187 @@ impl ReviewApp {
         let rows = self.tree_list_rows(cx);
         let current = self.active_data().and_then(|data| data.viewed_file());
         if let Some(pos) = current.and_then(|file| {
-            rows.iter().position(|&row| self.tree_row_file(row) == Some(file))
+            rows.iter()
+                .position(|&row| self.tree_row_file(row) == Some(file))
         }) {
             self.tree_cursor = pos;
         }
         self.tree_cursor = self.tree_cursor.min(rows.len().saturating_sub(1));
         window.focus(&self.tree_focus);
+        cx.notify();
+    }
+
+    /// Where showing `file` puts the cursor: its first hunk, else its header.
+    /// A hidden file's entry already points at the next shown file.
+    fn file_landing_row(&self, file: usize) -> Option<usize> {
+        let data = self.active_data()?;
+        let header = *data.file_rows.get(file)?;
+        if header >= data.rows.len() {
+            return data.rows.len().checked_sub(1);
+        }
+        let next_file = data
+            .file_rows
+            .iter()
+            .copied()
+            .find(|&ix| ix > header)
+            .unwrap_or(data.rows.len());
+        let first_hunk = data
+            .hunk_rows
+            .iter()
+            .copied()
+            .find(|&ix| ix >= header && ix < next_file);
+        Some(first_hunk.unwrap_or(header))
+    }
+
+    /// Recompute what's hidden and rebuild rows and tree after `viewed`
+    /// changed.
+    fn apply_viewed(&mut self, cx: &mut Context<Self>) {
+        let query = self.tree_filter_input.read(cx).value().to_string();
+        let viewed = self.viewed.clone();
+        if let Some(data) = self.active_data_mut() {
+            data.hidden = viewed_files(&data.diff, &viewed);
+            data.set_rows(build_rows(
+                &data.diff,
+                data.mode,
+                shown_files(&data.diff, &query, &data.hidden).as_ref(),
+            ));
+            data.selection = None;
+            data.rebuild_tree();
+        }
+    }
+
+    /// Space: mark the file under the tree cursor (tree focused) or the file
+    /// being read (diff focused) as viewed, hiding it and moving on to the
+    /// next file.
+    fn mark_viewed(&mut self, file: Option<usize>, window: &Window, cx: &mut Context<Self>) {
+        let files: Vec<usize> = match file {
+            Some(file) => vec![file],
+            None if self.tree_focus.is_focused(window) => self.tree_cursor_files(cx),
+            None => self
+                .active_data()
+                .and_then(|data| data.viewed_file())
+                .into_iter()
+                .collect(),
+        };
+        let Some(&last) = files.iter().max() else {
+            return;
+        };
+        let Some(entries) = self.active_data().map(|data| {
+            files
+                .iter()
+                .filter_map(|&ix| data.diff.files.get(ix))
+                .map(|f| (f.display_path().to_string(), file_hash(f)))
+                .collect::<Vec<_>>()
+        }) else {
+            return;
+        };
+        self.viewed.extend(entries);
+        self.apply_viewed(cx);
+        let rows = self.tree_list_rows(cx);
+        self.tree_cursor = self.tree_cursor.min(rows.len().saturating_sub(1));
+        // Continue after the last hidden file.
+        match self.file_landing_row(last) {
+            Some(row) => self.jump(row, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// Files under the tree cursor: the file itself, or every shown file
+    /// inside the directory it's on.
+    fn tree_cursor_files(&self, cx: &App) -> Vec<usize> {
+        let rows = self.tree_list_rows(cx);
+        let Some(&row) = rows.get(self.tree_cursor) else {
+            return Vec::new();
+        };
+        if let Some(file) = self.tree_row_file(row) {
+            return vec![file];
+        }
+        let (TreeListRow::Entry(entry_ix), Some(data)) = (row, self.active_data()) else {
+            return Vec::new();
+        };
+        let Some(TreeEntryKind::Dir { path }) = data.tree.get(entry_ix).map(|e| &e.kind) else {
+            return Vec::new();
+        };
+        let prefix = format!("{path}/");
+        data.diff
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(ix, f)| !data.hidden.contains(ix) && f.display_path().starts_with(&prefix))
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
+    /// `z`: open the file in Zed at the line being looked at — the selection
+    /// (with its column) or the cursor row, stepping to the nearest line that
+    /// exists in the working tree (removed lines and headers have none). From
+    /// the file tree, the file's first changed line.
+    fn open_in_editor(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let from_tree = self.tree_focus.is_focused(window);
+        let tree_file = from_tree
+            .then(|| {
+                let rows = self.tree_list_rows(cx);
+                rows.get(self.tree_cursor)
+                    .and_then(|&row| self.tree_row_file(row))
+            })
+            .flatten();
+        let Some(data) = self.active_data() else {
+            return;
+        };
+        let (row, col) = match (tree_file, data.selection) {
+            (Some(file), _) => match data.file_rows.get(file) {
+                Some(&header) => (header, None),
+                None => return,
+            },
+            (None, Some(sel)) => (
+                sel.head.row,
+                (sel.side != SelSide::Left).then_some(sel.head.col + 1),
+            ),
+            (None, None) => (data.cursor, None),
+        };
+        let Some(file) = data.file_rows.iter().rposition(|&ix| ix <= row) else {
+            return;
+        };
+        let start = data.file_rows[file];
+        let end = data
+            .file_rows
+            .get(file + 1)
+            .copied()
+            .unwrap_or(data.rows.len())
+            .min(data.rows.len());
+        let row = row.min(end.saturating_sub(1));
+        let line = (row..end)
+            .find_map(|ix| row_new_line(&data.rows[ix]))
+            .or_else(|| {
+                (start..row)
+                    .rev()
+                    .find_map(|ix| row_new_line(&data.rows[ix]))
+            })
+            .unwrap_or(1);
+        let col = col.filter(|_| row_new_line(&data.rows[row]).is_some());
+        let path = data
+            .src
+            .repo_root
+            .join(data.diff.files[file].display_path());
+        let target = match col {
+            Some(col) => format!("{}:{line}:{col}", path.display()),
+            None => format!("{}:{line}", path.display()),
+        };
+        match std::process::Command::new("zeditor").arg(&target).spawn() {
+            // The CLI hands off to the running Zed and exits; reap it.
+            Ok(mut child) => {
+                std::thread::spawn(move || child.wait());
+            }
+            Err(err) => {
+                self.refresh_error = Some(format!("couldn't run zeditor: {err}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn clear_viewed(&mut self, cx: &mut Context<Self>) {
+        self.viewed.clear();
+        self.apply_viewed(cx);
         cx.notify();
     }
 
@@ -2083,22 +2931,9 @@ impl ReviewApp {
         // Land on the file's first hunk so it becomes the current hunk and
         // ↑/↓ in the diff continue from there; header-only files (binary,
         // pure renames) land on the header.
-        let row = self.tree_row_file(rows[pos]).and_then(|file| {
-            let data = self.active_data()?;
-            let header = *data.file_rows.get(file)?;
-            let next_file = data
-                .file_rows
-                .iter()
-                .copied()
-                .find(|&ix| ix > header)
-                .unwrap_or(data.rows.len());
-            let first_hunk = data
-                .hunk_rows
-                .iter()
-                .copied()
-                .find(|&ix| ix > header && ix < next_file);
-            Some(first_hunk.unwrap_or(header))
-        });
+        let row = self
+            .tree_row_file(rows[pos])
+            .and_then(|file| self.file_landing_row(file));
         match row {
             Some(row) => self.jump(row, cx),
             None => cx.notify(),
@@ -2210,7 +3045,7 @@ impl ReviewApp {
             .bg(theme::mantle())
             .border_r_1()
             .border_color(theme::surface0())
-            .text_size(px(14.))
+            .text_size(px(18.))
             .child(
                 div()
                     .flex_1()
@@ -2223,43 +3058,76 @@ impl ReviewApp {
                         window.focus(&this.focus_handle);
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .p_2()
-                            .child(Input::new(&self.tree_filter_input).small()),
-                    )
+                    .child(div().p_2().child(Input::new(&self.tree_filter_input)))
                     .when(!self.exclude.is_empty(), |col| {
+                        col.child(div().px_2().pb_1().flex().flex_wrap().gap_1().children(
+                            self.exclude.iter().cloned().enumerate().map(|(ix, pat)| {
+                                render_exclude_tag(ix, SharedString::from(pat), &entity)
+                            }),
+                        ))
+                    })
+                    .child(div().px_2().pb_1().child(Input::new(&self.exclude_input)))
+                    .when(!self.viewed.is_empty(), |col| {
+                        let n = self.active_data().map_or(0, |data| data.hidden.len());
+                        col.child(
+                            div()
+                                .id("viewed-clear")
+                                .px_2()
+                                .pb_1()
+                                .text_size(px(16.))
+                                .text_color(theme::overlay0())
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme::text()))
+                                .child(SharedString::from(format!("{n} viewed · show again")))
+                                .on_click(cx.listener(|this, _, _, cx| this.clear_viewed(cx))),
+                        )
+                    })
+                    .when(!self.review.comments.is_empty(), |col| {
+                        let n = self.review.comments.len();
+                        let link = |id: &'static str, label: SharedString| {
+                            div()
+                                .id(id)
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme::text()))
+                                .child(label)
+                        };
                         col.child(
                             div()
                                 .px_2()
                                 .pb_1()
                                 .flex()
-                                .flex_wrap()
-                                .gap_1()
-                                .children(
-                                    self.exclude
-                                        .iter()
-                                        .cloned()
-                                        .enumerate()
-                                        .map(|(ix, pat)| {
-                                            render_exclude_tag(ix, SharedString::from(pat), &entity)
-                                        }),
+                                .gap_2()
+                                .text_size(px(16.))
+                                .text_color(theme::overlay0())
+                                .child(div().text_color(theme::peach()).child(SharedString::from(
+                                    format!("{n} comment{}", if n == 1 { "" } else { "s" }),
+                                )))
+                                .child(
+                                    link(
+                                        "review-copy",
+                                        if self.review_copied {
+                                            "copied ✓"
+                                        } else {
+                                            "copy report (c)"
+                                        }
+                                        .into(),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| this.copy_review(cx))),
+                                )
+                                .child(
+                                    link("review-clear", "clear (x)".into()).on_click(
+                                        cx.listener(|this, _, _, cx| this.clear_review(cx)),
+                                    ),
                                 ),
                         )
                     })
-                    .child(
-                        div()
-                            .px_2()
-                            .pb_1()
-                            .child(Input::new(&self.exclude_input).small()),
-                    )
                     .when(self.excluded_count > 0, |col| {
                         let n = self.excluded_count;
                         col.child(
                             div()
                                 .px_2()
                                 .pb_1()
-                                .text_size(px(12.))
+                                .text_size(px(16.))
                                 .text_color(theme::overlay0())
                                 .child(SharedString::from(format!(
                                     "{n} file{} excluded",
@@ -2273,8 +3141,12 @@ impl ReviewApp {
                             .min_h_0()
                             .key_context("FileTree")
                             .track_focus(&self.tree_focus)
-                            .on_action(cx.listener(|this, _: &TreeUp, _, cx| this.tree_move(-1, cx)))
-                            .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.tree_move(1, cx)))
+                            .on_action(
+                                cx.listener(|this, _: &TreeUp, _, cx| this.tree_move(-1, cx)),
+                            )
+                            .on_action(
+                                cx.listener(|this, _: &TreeDown, _, cx| this.tree_move(1, cx)),
+                            )
                             .on_action(cx.listener(|this, _: &TreeOpen, window, cx| {
                                 this.tree_activate(None, window, cx)
                             }))
@@ -2291,6 +3163,48 @@ impl ReviewApp {
                             .child(tree_list),
                     ),
             )
+            .child(self.render_commit_box(cx))
+    }
+
+    /// Message box and commit button pinned under the file tree.
+    fn render_commit_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let empty = self.commit_input.read(cx).value().trim().is_empty();
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .border_t_1()
+            .border_color(theme::surface0())
+            .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                window.focus(&this.focus_handle);
+                cx.notify();
+            }))
+            .child(Input::new(&self.commit_input))
+            .child(
+                Button::new("commit")
+                    .primary()
+                    .w_full()
+                    .label(if self.committing {
+                        "committing…"
+                    } else {
+                        "Commit all"
+                    })
+                    .loading(self.committing)
+                    .disabled(empty || self.committing || self.active_data().is_none())
+                    .on_click(cx.listener(|this, _, window, cx| this.commit(window, cx))),
+            )
+            .when_some(self.commit_status.clone(), |col, status| {
+                let (text, color) = match status {
+                    Ok(summary) => (
+                        SharedString::from(format!("committed {summary}")),
+                        theme::green(),
+                    ),
+                    Err(err) => (err, theme::red()),
+                };
+                col.child(div().text_size(px(15.)).text_color(color).child(text))
+            })
     }
 
     fn render_sidebar_resizer(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2300,11 +3214,15 @@ impl ReviewApp {
             .h_full()
             .cursor_col_resize()
             .bg(theme::surface0())
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                this.sidebar_resizing = true;
-                this.sidebar_resize_start = Some((f32::from(event.position.x), this.sidebar_width));
-                cx.stop_propagation();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.sidebar_resizing = true;
+                    this.sidebar_resize_start =
+                        Some((f32::from(event.position.x), this.sidebar_width));
+                    cx.stop_propagation();
+                }),
+            )
             .into_any_element()
     }
 
@@ -2316,10 +3234,13 @@ impl ReviewApp {
             ("p", "previous hunk"),
             ("down", "scroll hunk / next hunk"),
             ("up", "scroll hunk / previous hunk"),
+            ("left / right", "scroll sideways"),
             ("v", "unified / split"),
             ("/", "filter files"),
             ("ctrl-f", "filter files"),
             ("escape", "switch file tree / diff"),
+            ("space", "mark file / folder viewed (hide it)"),
+            ("z", "open in Zed at this line"),
             ("home", "top"),
             ("end", "bottom"),
             ("ctrl-b", "toggle sidebar"),
@@ -2328,6 +3249,9 @@ impl ReviewApp {
             ("ctrl--", "smaller font"),
             ("ctrl-0", "reset font"),
             ("ctrl-c", "copy selection"),
+            ("enter", "comment on hunk / selected lines"),
+            ("c", "copy review report"),
+            ("x", "clear review report"),
             ("ctrl-k", "keybindings"),
             ("ctrl-q", "quit"),
         ];
@@ -2338,10 +3262,13 @@ impl ReviewApp {
             .flex()
             .items_center()
             .justify_center()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                this.keybindings_visible = false;
-                cx.notify();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.keybindings_visible = false;
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .id("keybindings-panel")
@@ -2376,7 +3303,6 @@ impl ReviewApp {
             )
             .into_any_element()
     }
-
 }
 
 impl Render for ReviewApp {
@@ -2403,9 +3329,25 @@ impl Render for ReviewApp {
                 let scroll = data.scroll.clone();
                 let split_x = px(data.split_scroll_x);
                 let is_split = data.mode == ViewMode::Split;
+                // Thin outline around the cursor's hunk, drawn over the list
+                // so it stays put while the text scrolls sideways.
+                let hunk_outline = data.current_hunk().map(|(_, start, end)| {
+                    let rh = row_height();
+                    let top = start as f32 * rh
+                        + f32::from(data.scroll.0.borrow().base_handle.offset().y);
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px(top))
+                        .h(px((end - start) as f32 * rh))
+                        .border_1()
+                        .border_color(theme::blue())
+                });
                 div()
                     .size_full()
                     .relative()
+                    .overflow_hidden()
                     .flex()
                     .font_family(MONO)
                     .text_size(px(text_size()))
@@ -2479,7 +3421,8 @@ impl Render for ReviewApp {
                             match this.active_data() {
                                 Some(data) => {
                                     let sel = data.selection;
-                                    let hunk = data.current_hunk().map(|(_, start, end)| start..end);
+                                    let hunk =
+                                        data.current_hunk().map(|(_, start, end)| start..end);
                                     range
                                         .filter_map(|ix| data.rows.get(ix).map(|row| (ix, row)))
                                         .map(|(ix, row)| {
@@ -2488,7 +3431,28 @@ impl Render for ReviewApp {
                                                     .filter(|range| !range.is_empty())
                                                     .map(|range| (sel.side, range))
                                             });
-                                            let el = render_row(row, row_sel, split_x);
+                                            let el = match row {
+                                                Row::HunkHeader { label } => {
+                                                    let end = data
+                                                        .hunk_rows
+                                                        .iter()
+                                                        .chain(&data.file_rows)
+                                                        .copied()
+                                                        .filter(|&r| r > ix)
+                                                        .min()
+                                                        .unwrap_or(data.rows.len());
+                                                    let note = data
+                                                        .comment_target(ix..end, None, true)
+                                                        .and_then(|(path, span, _)| {
+                                                            this.review.find(&path, &span)
+                                                        })
+                                                        .map(|c| {
+                                                            this.review.comments[c].body.as_str()
+                                                        });
+                                                    render_hunk_header(label, note)
+                                                }
+                                                _ => render_row(row, row_sel, split_x),
+                                            };
                                             if hunk.as_ref().is_some_and(|h| h.contains(&ix)) {
                                                 div()
                                                     .relative()
@@ -2521,6 +3485,7 @@ impl Render for ReviewApp {
                         .flex_1()
                         .min_w_0(),
                     )
+                    .children(hunk_outline)
                     .child(Scrollbar::new(&data.scroll))
                     .into_any_element()
             }
@@ -2543,14 +3508,20 @@ impl Render for ReviewApp {
                 this.sidebar_width = (start_width + delta).clamp(180., 640.);
                 cx.notify();
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| {
-                this.sidebar_resizing = false;
-                this.sidebar_resize_start = None;
-            }))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| {
-                this.sidebar_resizing = false;
-                this.sidebar_resize_start = None;
-            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                    this.sidebar_resizing = false;
+                    this.sidebar_resize_start = None;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                    this.sidebar_resizing = false;
+                    this.sidebar_resize_start = None;
+                }),
+            )
             .on_action(cx.listener(|this, _: &NextFile, _, cx| {
                 let targets = this
                     .active_data()
@@ -2579,6 +3550,12 @@ impl Render for ReviewApp {
                     .unwrap_or_default();
                 this.jump_prev(&targets, cx)
             }))
+            .on_action(
+                cx.listener(|this, _: &OpenInEditor, window, cx| this.open_in_editor(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &MarkViewed, window, cx| this.mark_viewed(None, window, cx)),
+            )
             .on_action(cx.listener(|this, _: &HunkDown, _, cx| this.step_hunk(true, cx)))
             .on_action(cx.listener(|this, _: &HunkUp, _, cx| this.step_hunk(false, cx)))
             .on_action(cx.listener(|this, _: &GoToTop, _, cx| this.jump(0, cx)))
@@ -2617,6 +3594,17 @@ impl Render for ReviewApp {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }))
+            .on_action(
+                cx.listener(|this, _: &EditComment, window, cx| this.open_comment(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &CopyReview, _, cx| this.copy_review(cx)))
+            .on_action(cx.listener(|this, _: &ClearReview, _, cx| this.clear_review(cx)))
+            .on_action(cx.listener(|this, _: &ScrollLeft, window, cx| {
+                this.scroll_x_by_key(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollRight, window, cx| {
+                this.scroll_x_by_key(true, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_visible = !this.sidebar_visible;
                 cx.notify();
@@ -2645,13 +3633,21 @@ impl Render for ReviewApp {
                             .child(self.render_sidebar_resizer(cx))
                     })
                     .child(
+                        // The comment editor sits outside the ReviewApp key
+                        // context so typing in it doesn't hit diff bindings.
                         div()
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
-                            .key_context("ReviewApp")
-                            .track_focus(&self.focus_handle)
-                            .child(pane),
+                            .relative()
+                            .child(
+                                div()
+                                    .size_full()
+                                    .key_context("ReviewApp")
+                                    .track_focus(&self.focus_handle)
+                                    .child(pane),
+                            )
+                            .children(self.render_comment_editor(cx)),
                     ),
             )
             .when(self.keybindings_visible, |root| {
@@ -2665,7 +3661,7 @@ fn main() {
     // Default to the repo we're standing in; a single directory argument is
     // also accepted. Anything else is ignored (we only review local diffs).
     let repo_path = args
-        .get(0)
+        .first()
         .filter(|arg| Path::new(arg).is_dir())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -2674,7 +3670,8 @@ fn main() {
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
-            theme::apply_ui_theme(cx);
+            theme::init(cx);
+            theme::watch_omarchy_theme(cx);
             cx.bind_keys([
                 KeyBinding::new("]", NextFile, Some("ReviewApp")),
                 KeyBinding::new("[", PrevFile, Some("ReviewApp")),
@@ -2692,10 +3689,19 @@ fn main() {
                 KeyBinding::new("down", TreeDown, Some("FileTree")),
                 KeyBinding::new("enter", TreeOpen, Some("FileTree")),
                 KeyBinding::new("left", TreeCollapse, Some("FileTree")),
+                KeyBinding::new("left", ScrollLeft, Some("ReviewApp")),
+                KeyBinding::new("right", ScrollRight, Some("ReviewApp")),
                 KeyBinding::new("right", TreeExpand, Some("FileTree")),
                 KeyBinding::new("escape", FocusDiff, Some("FileTree")),
+                KeyBinding::new("space", MarkViewed, Some("FileTree")),
+                KeyBinding::new("space", MarkViewed, Some("ReviewApp")),
+                KeyBinding::new("z", OpenInEditor, Some("ReviewApp")),
+                KeyBinding::new("z", OpenInEditor, Some("FileTree")),
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
                 KeyBinding::new("ctrl-c", CopySelection, Some("ReviewApp")),
+                KeyBinding::new("enter", EditComment, Some("ReviewApp")),
+                KeyBinding::new("c", CopyReview, Some("ReviewApp")),
+                KeyBinding::new("x", ClearReview, Some("ReviewApp")),
                 KeyBinding::new("ctrl-=", ZoomIn, None),
                 KeyBinding::new("ctrl-+", ZoomIn, None),
                 KeyBinding::new("ctrl--", ZoomOut, None),
@@ -2738,6 +3744,92 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn item_with_hidden(hidden: &[usize]) -> ItemData {
+        let patch = ["a/x.txt", "z/w.txt", "z/y.txt"]
+            .iter()
+            .map(|p| {
+                format!("diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1 +1,2 @@\n one\n+two\n")
+            })
+            .collect::<String>();
+        let diff = diff_core::parse_patch(&patch);
+        let hidden: HashSet<usize> = hidden.iter().copied().collect();
+        let (rows, file_rows, hunk_rows) = build_rows(
+            &diff,
+            ViewMode::Unified,
+            shown_files(&diff, "", &hidden).as_ref(),
+        );
+        let (widest_row_ix, max_line_chars) = widest_line(&rows);
+        ItemData {
+            src: git::LocalSource {
+                repo_root: PathBuf::from("/r"),
+                branch: "main".into(),
+                base_ref: None,
+                base_label: "HEAD".into(),
+                base_oid: None,
+            },
+            diff,
+            mode: ViewMode::Unified,
+            rows,
+            file_rows,
+            hunk_rows,
+            max_line_chars,
+            widest_row_ix,
+            split_scroll_x: 0.,
+            cursor: 0,
+            scroll: UniformListScrollHandle::new(),
+            additions: 0,
+            deletions: 0,
+            selection: None,
+            tree: Vec::new(),
+            collapsed: HashSet::new(),
+            tree_scroll: UniformListScrollHandle::new(),
+            tree_last_file: None,
+            hidden,
+        }
+    }
+
+    /// Hiding the trailing files leaves their `file_rows` entries at
+    /// `rows.len()`; path lookups must skip them rather than index past the end.
+    #[test]
+    fn lookups_survive_hidden_trailing_files() {
+        let data = item_with_hidden(&[1, 2]);
+        assert!(data.file_rows.iter().any(|&f| f >= data.rows.len()));
+        let span = review::Span {
+            side: review::Side::New,
+            start: 2,
+            end: 2,
+        };
+        assert!(data.span_end_row("z/y.txt", &span).is_none());
+        let row = data.span_end_row("a/x.txt", &span).unwrap();
+        let anchor = data.anchor_at(row).unwrap();
+        assert_eq!(data.resolve_anchor(&anchor), Some(row));
+        let gone = RowAnchor {
+            path: "z/w.txt".into(),
+            lines: None,
+            from_file: 0,
+        };
+        assert_eq!(data.resolve_anchor(&gone), None);
+    }
+
+    /// A hidden file in the middle shares the next file's header row.
+    #[test]
+    fn lookups_with_hidden_middle_file() {
+        let data = item_with_hidden(&[1]);
+        let span = review::Span {
+            side: review::Side::New,
+            start: 2,
+            end: 2,
+        };
+        let row = data.span_end_row("z/y.txt", &span).unwrap();
+        let (path, range) = data.file_of(row).unwrap();
+        assert_eq!(path.as_ref(), "z/y.txt");
+        assert!(range.contains(&row));
+        let (_, span_found, _) = data.comment_target(range, None, true).unwrap();
+        assert_eq!(span_found, span);
+    }
+
     #[test]
     fn relevant_changes() {
         use super::is_relevant_change as rel;
@@ -2756,7 +3848,12 @@ mod tests {
     #[test]
     fn exclude_patterns() {
         use super::path_excluded as ex;
-        for pat in ["__generated__", "*/__generated__/*", "__generated__/", "./__generated__"] {
+        for pat in [
+            "__generated__",
+            "*/__generated__/*",
+            "__generated__/",
+            "./__generated__",
+        ] {
             assert!(ex(pat, "__generated__/a.ts"), "{pat}");
             assert!(ex(pat, "src/x/__generated__/a.ts"), "{pat}");
             assert!(!ex(pat, "src/generated/a.ts"), "{pat}");
@@ -2767,7 +3864,6 @@ mod tests {
         assert!(!ex("", "a.rs"));
     }
 
-    use super::*;
     use diff_core::Hunk;
 
     fn add(new_no: u32, text: &str) -> DiffRow {
@@ -2825,13 +3921,30 @@ mod tests {
         let diff = PrDiff {
             files: vec![file(
                 "a.rs",
-                vec![hunk(vec![rem(1, "a"), rem(2, "b"), add(1, "c"), add(2, "d")])],
+                vec![hunk(vec![
+                    rem(1, "a"),
+                    rem(2, "b"),
+                    add(1, "c"),
+                    add(2, "d"),
+                ])],
             )],
         };
         let (rows, _, _) = build_rows(&diff, ViewMode::Split, None);
         assert_eq!(rows.len(), 4);
-        assert!(matches!(&rows[2], Row::SplitLine { left: Some(_), right: Some(_) }));
-        assert!(matches!(&rows[3], Row::SplitLine { left: Some(_), right: Some(_) }));
+        assert!(matches!(
+            &rows[2],
+            Row::SplitLine {
+                left: Some(_),
+                right: Some(_)
+            }
+        ));
+        assert!(matches!(
+            &rows[3],
+            Row::SplitLine {
+                left: Some(_),
+                right: Some(_)
+            }
+        ));
     }
 
     #[test]

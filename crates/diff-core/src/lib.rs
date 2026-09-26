@@ -605,11 +605,15 @@ index 6666666..7777777 100644
     fn intra_line_set_on_paired_run() {
         let diff = parse_patch(SAMPLE);
         match &diff.files[0].hunks[1].rows[1] {
-            DiffRow::Removed { intra, .. } => assert_eq!(intra, &vec![0..3]),
+            DiffRow::Removed { intra, .. } => {
+                assert_eq!(intra.as_slice(), [Range { start: 0, end: 3 }])
+            }
             other => panic!("expected removed row, got {other:?}"),
         }
         match &diff.files[0].hunks[1].rows[2] {
-            DiffRow::Added { intra, .. } => assert_eq!(intra, &vec![0..3]),
+            DiffRow::Added { intra, .. } => {
+                assert_eq!(intra.as_slice(), [Range { start: 0, end: 3 }])
+            }
             other => panic!("expected added row, got {other:?}"),
         }
     }

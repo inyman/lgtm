@@ -3201,6 +3201,8 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "notify",
+ "serde",
+ "serde_json",
  "syntax",
 ]
 

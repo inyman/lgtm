@@ -225,6 +225,39 @@ pub fn diff_patch(src: &LocalSource) -> Result<String> {
     Ok(patch)
 }
 
+/// Stages every change (tracked and untracked, honoring .gitignore) and
+/// commits it with `message`. Returns git's one-line summary.
+pub fn commit_all(repo_root: &Path, message: &str) -> Result<String> {
+    use std::io::Write;
+    git(repo_root, &["add", "-A"])?;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["commit", "--quiet", "-F", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| anyhow!("failed to run git: {err}"))?;
+    child
+        .stdin
+        .take()
+        .context("git commit stdin")?
+        .write_all(message.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let msg = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
+        bail!("git commit failed: {}", msg.trim());
+    }
+    git(repo_root, &["log", "-1", "--format=%h %s"]).map(|s| s.trim().to_string())
+}
+
 /// Whether any of `paths` (inside `repo_root`) is not gitignored — i.e. a
 /// change there could show up in the diff. Errs toward `true` if git fails.
 pub fn any_unignored(repo_root: &Path, paths: &[PathBuf]) -> bool {
@@ -256,7 +289,11 @@ pub fn any_unignored(repo_root: &Path, paths: &[PathBuf]) -> bool {
     // Exit 1 means none were ignored; anything but 0/1 is an error.
     match output.status.code() {
         Some(0) => {
-            let ignored = output.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()).count();
+            let ignored = output
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|p| !p.is_empty())
+                .count();
             ignored < paths.len()
         }
         _ => true,
@@ -295,7 +332,7 @@ mod tests {
         fs::create_dir_all(dir.join("dist")).unwrap();
         let dist = dir.join("dist/a.js");
         let src = dir.join("src.rs");
-        assert!(!any_unignored(&dir, &[dist.clone()]));
+        assert!(!any_unignored(&dir, std::slice::from_ref(&dist)));
         assert!(any_unignored(&dir, &[dist, src]));
         assert!(!any_unignored(&dir, &[]));
     }
@@ -318,6 +355,20 @@ mod tests {
         run(dir, &["git", "config", "user.email", "test@example.com"]);
         run(dir, &["git", "config", "user.name", "Test"]);
         run(dir, &["git", "config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn commit_all_stages_untracked_and_reports_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        fs::write(dir.join("a.rs"), "fn main() {}\n").unwrap();
+        let summary = commit_all(dir, "Add main\n\nWith a body.").unwrap();
+        assert!(summary.ends_with(" Add main"), "{summary}");
+        let src = resolve_local(dir).unwrap();
+        assert!(diff_patch(&src).unwrap().is_empty());
+        // Nothing left to commit.
+        assert!(commit_all(dir, "again").is_err());
     }
 
     #[test]
@@ -494,13 +545,27 @@ mod tests {
         let fork = tmp.path().join("fork");
         run(
             tmp.path(),
-            &["git", "clone", upstream.to_str().unwrap(), fork.to_str().unwrap()],
+            &[
+                "git",
+                "clone",
+                upstream.to_str().unwrap(),
+                fork.to_str().unwrap(),
+            ],
         );
         run(&fork, &["git", "remote", "rename", "origin", "upstream"]);
         let empty_origin = tmp.path().join("origin");
         fs::create_dir(&empty_origin).unwrap();
         init_repo(&empty_origin);
-        run(&fork, &["git", "remote", "add", "origin", empty_origin.to_str().unwrap()]);
+        run(
+            &fork,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                empty_origin.to_str().unwrap(),
+            ],
+        );
         run(&fork, &["git", "config", "user.email", "test@example.com"]);
         run(&fork, &["git", "config", "user.name", "Test"]);
         run(&fork, &["git", "config", "commit.gpgsign", "false"]);

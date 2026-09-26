@@ -2,24 +2,42 @@
 # Launch lgtm (agent-review) on a project: pick a git repo under ~/Projects,
 # then build lgtm from its checkout and open the picked repo's diff.
 #
-# The picker lists every git repo directly under ~/Projects, most recently
-# touched first, each with its branch and how many files have changes.
+# The picker lists every git repo directly under ~/Projects and all of its
+# worktrees (including Zed's under ~/Projects/worktrees), most recently touched
+# first, each as "<project> · <branch>" with its change count and path.
 
 lgtm_repo="__LGTM_REPO__"
 projects="$HOME/Projects"
 
+# Every checkout of every repo under ~/Projects: the main checkout plus its
+# git worktrees (Zed puts those in ~/Projects/worktrees/<project>/<name>/<project>),
+# as "<mtime> <path>" lines so the menu can list recently touched ones first.
+checkouts() {
+  for repo in "$projects"/*/; do
+    repo="${repo%/}"
+    [[ -d "$repo/.git" ]] || continue
+    git -C "$repo" worktree list --porcelain 2>/dev/null |
+      sed -n 's/^worktree //p' |
+      while IFS= read -r dir; do
+        [[ -d "$dir" ]] && echo "$(stat -c %Y "$dir") $dir"
+      done
+  done
+}
+
 paths=()
 rows=()
 while IFS= read -r dir; do
-  [[ -e "$dir/.git" ]] || continue
   branch=$(git -C "$dir" branch --show-current 2>/dev/null)
   [[ -z "$branch" ]] && branch="detached"
   changed=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l)
+  # Name worktrees by their repo (the main checkout's folder) and branch.
+  common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  project=$(basename "$(dirname "$common")")
   paths+=("$dir")
   # omarchy-menu-select rows are "<glyph><TAB><label><TAB><subtext>"; it
-  # returns "<label><TAB><subtext>", which the subtext keeps unique.
-  rows+=($'\t'"$(basename "$dir")"$'\t'"$branch · $changed changed · ${dir/#$HOME/\~}")
-done < <(ls -1dt "$projects"/*/ 2>/dev/null | sed 's#/$##')
+  # returns "<label><TAB><subtext>", which the subtext (path) keeps unique.
+  rows+=($'\t'"$project · $branch"$'\t'"$changed changed · ${dir/#$HOME/\~}")
+done < <(checkouts | sort -rn | cut -d' ' -f2-)
 
 if (( ${#paths[@]} == 0 )); then
   notify-send "agent-review" "No git repos found in ${projects/#$HOME/\~}"
