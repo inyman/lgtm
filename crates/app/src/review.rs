@@ -102,6 +102,13 @@ impl Review {
         self.save();
     }
 
+    /// Drops the comments on `paths`, e.g. once they're committed.
+    pub fn forget<'a>(&mut self, paths: impl IntoIterator<Item = &'a str>) {
+        let paths: Vec<&str> = paths.into_iter().collect();
+        self.comments.retain(|c| !paths.contains(&c.path.as_str()));
+        self.save();
+    }
+
     pub fn clear(&mut self) {
         self.comments.clear();
         self.save();
@@ -144,17 +151,7 @@ impl Review {
 /// `<git dir>/lgtm/review.json`: inside the git dir so it never shows up in
 /// the diff, and per worktree.
 fn review_file(repo_root: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["rev-parse", "--absolute-git-dir"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let dir = String::from_utf8(out.stdout).ok()?;
-    Some(Path::new(dir.trim()).join("lgtm").join("review.json"))
+    git::state_dir(repo_root).map(|dir| dir.join("review.json"))
 }
 
 #[cfg(test)]

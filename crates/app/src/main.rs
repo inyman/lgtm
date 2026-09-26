@@ -5,6 +5,7 @@
 //! as one reviewable diff with syntax highlighting, word-level intra-line
 //! diffs, unified/split views, and a file tree.
 
+mod buckets;
 mod review;
 mod theme;
 
@@ -12,7 +13,7 @@ use diff_core::{DiffRow, FileDiff, FileStatus, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
     actions, div, font, point, prelude::*, px, size, uniform_list, App, Application, Bounds,
-    ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding, Keystroke,
+    ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding, KeyDownEvent, Keystroke,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Point, ScrollStrategy, ScrollWheelEvent, SharedString, StyledText, Subscription,
     TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
@@ -89,6 +90,7 @@ actions!(
         ToggleKeybindings,
         EditComment,
         ClearReview,
+        MoveToBucket,
         ScrollLeft,
         ScrollRight,
         CopyReview,
@@ -273,14 +275,49 @@ fn file_hash(file: &FileDiff) -> u64 {
     h.finish()
 }
 
-/// Indices of files marked viewed whose diff hasn't changed since.
-fn viewed_files(diff: &PrDiff, viewed: &HashMap<String, u64>) -> HashSet<usize> {
-    diff.files
+/// Indices of files hidden from diff and tree: outside the selected bucket,
+/// or marked viewed with their diff unchanged since. Also counts the viewed
+/// ones (within the bucket).
+fn hidden_files(
+    diff: &PrDiff,
+    viewed: &HashMap<String, u64>,
+    buckets: &buckets::Buckets,
+    filters: &[String],
+    selected: &buckets::Selected,
+) -> (HashSet<usize>, usize) {
+    let mut viewed_count = 0;
+    let hidden = diff
+        .files
         .iter()
         .enumerate()
-        .filter(|(_, f)| viewed.get(f.display_path()) == Some(&file_hash(f)))
+        .filter(|(_, f)| {
+            let path = f.display_path();
+            if !buckets.contains(selected, path, is_filtered(filters, path)) {
+                return true;
+            }
+            let is_viewed = viewed.get(f.display_path()) == Some(&file_hash(f));
+            viewed_count += usize::from(is_viewed);
+            is_viewed
+        })
         .map(|(ix, _)| ix)
-        .collect()
+        .collect();
+    (hidden, viewed_count)
+}
+
+/// Whether `path` matches a filter pattern, putting it in Filtered out.
+fn is_filtered(filters: &[String], path: &str) -> bool {
+    filters.iter().any(|pat| path_excluded(pat, path))
+}
+
+/// Every path a file's commit involves: its path, plus the old one for a
+/// rename.
+fn file_paths(file: &FileDiff) -> impl Iterator<Item = &str> {
+    let new = file.display_path();
+    std::iter::once(new).chain(
+        file.old_path
+            .as_deref()
+            .filter(|old| file.status == FileStatus::Renamed && *old != new),
+    )
 }
 
 /// `only` limits the rows to those files. `file_rows` still has one entry
@@ -1280,8 +1317,13 @@ struct ItemData {
     collapsed: HashSet<String>,
     tree_scroll: UniformListScrollHandle,
     tree_last_file: Option<usize>,
-    /// Files marked viewed (unchanged since), hidden from diff and tree.
+    /// Files hidden from diff and tree: outside the selected bucket, or
+    /// marked viewed (unchanged since).
     hidden: HashSet<usize>,
+    /// How many of `hidden` are hidden as viewed.
+    viewed_count: usize,
+    /// Each changed path's reviewed state, for commits to check against.
+    states: HashMap<String, git::Expected>,
 }
 
 impl ItemData {
@@ -1502,11 +1544,12 @@ struct Loaded {
     src: git::LocalSource,
     diff: PrDiff,
     hidden: HashSet<usize>,
+    viewed_count: usize,
+    states: HashMap<String, git::Expected>,
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
     mode: ViewMode,
-    excluded: usize,
     patch_hash: u64,
 }
 
@@ -1530,7 +1573,7 @@ fn is_relevant_change(root: &Path, path: &Path) -> bool {
     }
 }
 
-/// Patterns excluded on startup; each shows as a removable tag.
+/// Filtered out's patterns on startup; each shows as a removable tag.
 const DEFAULT_EXCLUDES: &[&str] = &["__generated__", "*.wasm", "*.glb", "*.png"];
 
 /// Whether `path` is excluded by `pattern`. The glob is tried against every
@@ -1588,9 +1631,11 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 fn fetch_item(
     path: &Path,
     mode: ViewMode,
-    exclude: &[String],
+    filters: &[String],
     query: &str,
     viewed: &HashMap<String, u64>,
+    buckets: &buckets::Buckets,
+    selected: &buckets::Selected,
 ) -> anyhow::Result<Loaded> {
     // Uncommitted changes only: the view is a review → commit loop, so a
     // commit clears it.
@@ -1602,22 +1647,23 @@ fn fetch_item(
         patch.hash(&mut h);
         h.finish()
     };
-    let mut diff = diff_core::parse_patch(&patch);
-    let total = diff.files.len();
-    diff.files.retain(|f| {
-        !exclude
-            .iter()
-            .any(|pat| path_excluded(pat, f.display_path()))
-    });
-    let excluded = total - diff.files.len();
-    let hidden = viewed_files(&diff, viewed);
+    let diff = diff_core::parse_patch(&patch);
+    let (hidden, viewed_count) = hidden_files(&diff, viewed, buckets, filters, selected);
     let (rows, file_rows, hunk_rows) =
         build_rows(&diff, mode, shown_files(&diff, query, &hidden).as_ref());
+    let paths: Vec<String> = diff
+        .files
+        .iter()
+        .flat_map(file_paths)
+        .map(str::to_string)
+        .collect();
+    let states = git::worktree_state(&src.repo_root, &paths);
     Ok(Loaded {
         src,
         diff,
         hidden,
-        excluded,
+        viewed_count,
+        states,
         patch_hash,
         rows,
         file_rows,
@@ -1718,11 +1764,10 @@ struct ReviewApp {
     /// Excludes the last fetch was spawned with, to skip no-op refetches.
     applied_exclude: Vec<String>,
     exclude_debounce: Option<gpui::Task<()>>,
-    excluded_count: usize,
     /// Hash of the patch behind the installed rows, plus the mode/excludes it
     /// was built with; a refetch that matches is dropped so watcher noise
     /// doesn't reset scroll or selection.
-    installed_key: Option<(u64, ViewMode, Vec<String>)>,
+    installed_key: Option<(u64, ViewMode)>,
     _watcher: Option<notify::RecommendedWatcher>,
     focus_handle: FocusHandle,
     /// Keyboard focus for the sidebar file tree, and its cursor (a position
@@ -1741,10 +1786,28 @@ struct ReviewApp {
     /// The report was just copied; cleared when the review changes.
     review_copied: bool,
     commit_input: gpui::Entity<InputState>,
+    buckets: buckets::Buckets,
+    /// The bucket shown, and what Commit commits.
+    selected: buckets::Selected,
+    bucket_input: gpui::Entity<InputState>,
+    /// Naming a new bucket (the input shows in the tabs row).
+    creating_bucket: bool,
+    /// Files waiting for the bucket picker (`m`).
+    moving: Option<Vec<String>>,
+    picker_focus: FocusHandle,
     committing: bool,
     /// Result of the last commit: Ok(summary) or Err(message).
     commit_status: Option<Result<SharedString, SharedString>>,
     _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Default)]
+struct BucketCounts {
+    /// Everything but Filtered out.
+    all: usize,
+    default: usize,
+    filtered: usize,
+    named: Vec<usize>,
 }
 
 /// A comment being written or edited: the review entry it replaces, if any,
@@ -1761,7 +1824,7 @@ impl ReviewApp {
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
         let exclude_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("exclude, e.g. __generated__ (enter to pin)")
+            InputState::new(window, cx).placeholder("add pattern, e.g. __generated__ (enter)")
         });
         let comment_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -1773,7 +1836,18 @@ impl ReviewApp {
                 .auto_grow(2, 8)
                 .placeholder("commit message (ctrl-enter to commit)")
         });
+        let bucket_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("bucket name, enter to create"));
         let _subscriptions = vec![
+            cx.subscribe_in(
+                &bucket_input,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.create_bucket(window, cx);
+                    }
+                },
+            ),
             cx.subscribe_in(
                 &commit_input,
                 window,
@@ -1823,6 +1897,7 @@ impl ReviewApp {
                 },
             ),
         ];
+        let buckets = buckets::Buckets::load(&repo_path);
         let mut this = Self {
             state: LoadState::Loading,
             reloading: false,
@@ -1838,7 +1913,6 @@ impl ReviewApp {
             exclude: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
             applied_exclude: Vec::new(),
             exclude_debounce: None,
-            excluded_count: 0,
             installed_key: None,
             _watcher: None,
             focus_handle: cx.focus_handle(),
@@ -1853,6 +1927,12 @@ impl ReviewApp {
             editing: None,
             review_copied: false,
             commit_input,
+            buckets,
+            selected: buckets::Selected::All,
+            bucket_input,
+            creating_bucket: false,
+            moving: None,
+            picker_focus: cx.focus_handle(),
             committing: false,
             commit_status: None,
             _subscriptions,
@@ -1867,26 +1947,23 @@ impl ReviewApp {
         self.applied_exclude = exclude.clone();
         let query = self.tree_filter_input.read(cx).value().to_string();
         let viewed = self.viewed.clone();
+        let buckets = self.buckets.clone();
+        let selected = self.selected.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
                 .background_spawn({
                     let exclude = exclude.clone();
                     let query = query.clone();
-                    async move { fetch_item(&repo, mode, &exclude, &query, &viewed) }
+                    async move {
+                        fetch_item(&repo, mode, &exclude, &query, &viewed, &buckets, &selected)
+                    }
                 })
                 .await;
             this.update(cx, |app, cx| {
                 app.reloading = false;
-                // Excludes changed mid-fetch (the refresh they asked for was
-                // skipped while this one ran): fetch again with the new list.
-                if app.effective_exclude(cx) != exclude {
-                    app.reloading = matches!(app.state, LoadState::Ready(_));
-                    app.spawn_fetch(mode, cx);
-                    return;
-                }
                 match fetched {
                     Ok(loaded) => {
-                        let key = Some((loaded.patch_hash, loaded.mode, exclude));
+                        let key = Some((loaded.patch_hash, loaded.mode));
                         let unchanged = key == app.installed_key
                             && matches!(&app.state, LoadState::Ready(d) if d.mode == loaded.mode);
                         if !unchanged {
@@ -1895,6 +1972,10 @@ impl ReviewApp {
                             // The file filter changed while fetching.
                             if app.tree_filter_input.read(cx).value().as_ref() != query {
                                 app.apply_file_filter(cx);
+                            }
+                            // Filters changed while fetching.
+                            if app.effective_exclude(cx) != exclude {
+                                app.apply_viewed(cx);
                             }
                         }
                     }
@@ -1918,18 +1999,18 @@ impl ReviewApp {
             src,
             diff,
             hidden,
+            viewed_count,
+            states,
             rows,
             file_rows,
             hunk_rows,
             mode,
-            excluded,
             patch_hash: _,
         } = loaded;
         if self._watcher.is_none() {
             self.review = review::Review::load(&src.repo_root);
             self.watch_repo(src.repo_root.clone(), cx);
         }
-        self.excluded_count = excluded;
         let (additions, deletions) = diff
             .files
             .iter()
@@ -1940,6 +2021,8 @@ impl ReviewApp {
                 data.src = src;
                 data.diff = diff;
                 data.hidden = hidden;
+                data.viewed_count = viewed_count;
+                data.states = states;
                 data.additions = additions;
                 data.deletions = deletions;
                 // Keep the viewport and cursor on the same content: changes
@@ -1975,6 +2058,8 @@ impl ReviewApp {
                     src,
                     diff,
                     hidden,
+                    viewed_count,
+                    states,
                     mode,
                     rows,
                     file_rows,
@@ -2094,20 +2179,31 @@ impl ReviewApp {
         let Some(root) = self.active_data().map(|data| data.src.repo_root.clone()) else {
             return;
         };
+        let files = self.bucket_commit_files(cx);
+        if files.is_empty() {
+            return;
+        }
         self.committing = true;
         self.commit_status = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
+            let paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
             let result = cx
-                .background_spawn(async move { git::commit_all(&root, &message) })
+                .background_spawn(async move { git::commit_files(&root, &files, &message) })
                 .await;
             this.update_in(cx, |app, window, cx| {
                 app.committing = false;
                 match result {
-                    Ok(summary) => {
-                        app.commit_status = Some(Ok(summary.into()));
-                        // The comments were about what just got committed.
-                        app.review.clear();
+                    Ok(done) => {
+                        let status = match done.warning {
+                            Some(warning) => format!("{}\n{warning}", done.summary),
+                            None => done.summary,
+                        };
+                        app.commit_status = Some(Ok(status.into()));
+                        // Its files left the diff: drop their bucket entries
+                        // and the comments about them.
+                        app.buckets.forget(paths.iter().map(String::as_str));
+                        app.review.forget(paths.iter().map(String::as_str));
                         app.editing = None;
                         app.review_copied = false;
                         app.commit_input
@@ -2121,6 +2217,395 @@ impl ReviewApp {
             .ok();
         })
         .detach();
+    }
+
+    /// The selected bucket's files with their reviewed states, viewed ones
+    /// included.
+    fn bucket_commit_files(&self, cx: &App) -> Vec<(String, git::Expected)> {
+        let Some(data) = self.active_data() else {
+            return Vec::new();
+        };
+        let filters = self.effective_exclude(cx);
+        data.diff
+            .files
+            .iter()
+            .filter(|f| {
+                let path = f.display_path();
+                self.buckets
+                    .contains(&self.selected, path, is_filtered(&filters, path))
+            })
+            .flat_map(file_paths)
+            .map(|path| {
+                // Unfingerprinted (it was changing): a blob that can't match.
+                let state = data
+                    .states
+                    .get(path)
+                    .cloned()
+                    .unwrap_or(git::Expected::Blob(String::new()));
+                (path.to_string(), state)
+            })
+            .collect()
+    }
+
+    /// How many diff files each bucket holds: (All, Default, per name).
+    /// How many diff files each bucket holds.
+    fn bucket_counts(&self, cx: &App) -> BucketCounts {
+        let mut counts = BucketCounts {
+            named: vec![0; self.buckets.names.len()],
+            ..Default::default()
+        };
+        let Some(data) = self.active_data() else {
+            return counts;
+        };
+        let filters = self.effective_exclude(cx);
+        for f in &data.diff.files {
+            let path = f.display_path();
+            if is_filtered(&filters, path) {
+                counts.filtered += 1;
+                continue;
+            }
+            counts.all += 1;
+            match self.buckets.bucket_of(path) {
+                Some(name) => {
+                    if let Some(i) = self.buckets.names.iter().position(|n| n == name) {
+                        counts.named[i] += 1;
+                    }
+                }
+                None => counts.default += 1,
+            }
+        }
+        counts
+    }
+
+    fn select_bucket(&mut self, selected: buckets::Selected, cx: &mut Context<Self>) {
+        if self.selected == selected {
+            return;
+        }
+        self.selected = selected;
+        self.commit_status = None;
+        self.apply_viewed(cx);
+        self.tree_cursor = 0;
+        if let Some(data) = self.active_data() {
+            data.tree_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
+        self.jump(0, cx);
+    }
+
+    fn create_bucket(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.bucket_input.read(cx).value().trim().to_string();
+        if !self.buckets.create(&name) {
+            return;
+        }
+        self.creating_bucket = false;
+        self.bucket_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        // Named from the picker: the files being moved go straight in.
+        if self.moving.is_some() {
+            self.move_to_bucket(Some(name), window, cx);
+        } else {
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
+    }
+
+    fn start_new_bucket(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = true;
+        self.creating_bucket = true;
+        self.bucket_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn delete_bucket(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.buckets.delete(name);
+        self.selected = buckets::Selected::All;
+        self.apply_viewed(cx);
+        cx.notify();
+    }
+
+    /// `m`: pick a bucket for the file being read, or the file or folder
+    /// under the tree cursor.
+    fn open_bucket_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let files = if self.tree_focus.is_focused(window) {
+            self.tree_cursor_files(cx)
+        } else {
+            self.active_data()
+                .and_then(|data| data.viewed_file())
+                .into_iter()
+                .collect()
+        };
+        let Some(data) = self.active_data() else {
+            return;
+        };
+        // Filtered-out files belong to their patterns, not to a bucket.
+        let filters = self.effective_exclude(cx);
+        let paths: Vec<String> = files
+            .iter()
+            .filter_map(|&ix| data.diff.files.get(ix))
+            .map(|f| f.display_path())
+            .filter(|path| !is_filtered(&filters, path))
+            .map(str::to_string)
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.moving = Some(paths);
+        window.focus(&self.picker_focus);
+        cx.notify();
+    }
+
+    fn close_bucket_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.moving = None;
+        self.creating_bucket = false;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Puts the picked files in bucket `name` (None: Default); they leave
+    /// the view if another bucket is shown.
+    fn move_to_bucket(
+        &mut self,
+        name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(paths) = self.moving.take() else {
+            return;
+        };
+        self.buckets
+            .assign(paths.iter().map(String::as_str), name.as_deref());
+        window.focus(&self.focus_handle);
+        let last = self.active_data().and_then(|data| {
+            data.diff
+                .files
+                .iter()
+                .rposition(|f| paths.iter().any(|p| p == f.display_path()))
+        });
+        match last {
+            Some(last) => self.hide_and_move_on(last, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// The `m` picker: digits pick a bucket, `n` names a new one.
+    fn render_bucket_picker(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let paths = self.moving.as_ref()?;
+        let what: SharedString = match paths.as_slice() {
+            [one] => one.clone().into(),
+            many => format!("{} files", many.len()).into(),
+        };
+        let mut options: Vec<(SharedString, Option<String>)> = vec![("Default".into(), None)];
+        options.extend(
+            self.buckets
+                .names
+                .iter()
+                .take(8)
+                .map(|n| (n.clone().into(), Some(n.clone()))),
+        );
+        let row = |key: SharedString, label: SharedString| {
+            div()
+                .flex()
+                .gap_3()
+                .px_2()
+                .py_1()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::surface0()))
+                .child(div().w(px(16.)).text_color(theme::blue()).child(key))
+                .child(label)
+        };
+        let mut list = div().flex().flex_col().gap_1();
+        for (i, (label, name)) in options.into_iter().enumerate() {
+            list = list.child(
+                row(format!("{}", i + 1).into(), label)
+                    .id(("bucket-pick", i))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.move_to_bucket(name.clone(), window, cx)
+                    })),
+            );
+        }
+        list = list.child(
+            row("n".into(), "new bucket…".into())
+                .id("bucket-pick-new")
+                .on_click(cx.listener(|this, _, window, cx| this.start_new_bucket(window, cx))),
+        );
+        Some(
+            div()
+                .absolute()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(Hsla::from(theme::crust()).opacity(0.6))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.close_bucket_picker(window, cx)
+                    }),
+                )
+                .child(
+                    div()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .track_focus(&self.picker_focus)
+                        .key_context("BucketPicker")
+                        .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                            this.close_bucket_picker(window, cx)
+                        }))
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            // Typing a new bucket's name goes to its input.
+                            if this.creating_bucket {
+                                return;
+                            }
+                            let key = event.keystroke.key.as_str();
+                            match key {
+                                "escape" => this.close_bucket_picker(window, cx),
+                                "n" => this.start_new_bucket(window, cx),
+                                _ => {
+                                    let Some(d) = key.parse::<usize>().ok().filter(|d| *d >= 1)
+                                    else {
+                                        return;
+                                    };
+                                    if d == 1 {
+                                        this.move_to_bucket(None, window, cx);
+                                    } else if let Some(name) =
+                                        this.buckets.names.get(d - 2).cloned()
+                                    {
+                                        this.move_to_bucket(Some(name), window, cx);
+                                    }
+                                }
+                            }
+                            cx.stop_propagation();
+                        }))
+                        .w(px(360.))
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .bg(theme::mantle())
+                        .border_1()
+                        .border_color(theme::surface0())
+                        .rounded(px(8.))
+                        .shadow_lg()
+                        .text_size(px(16.))
+                        .child(
+                            div()
+                                .text_color(theme::overlay0())
+                                .truncate()
+                                .child(SharedString::from(format!("move {what} to"))),
+                        )
+                        .child(list)
+                        .when(self.creating_bucket, |col| {
+                            col.child(Input::new(&self.bucket_input))
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Bucket tabs: All, Default, each named bucket, and `+`.
+    fn render_bucket_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use buckets::Selected;
+        let BucketCounts {
+            all,
+            default,
+            filtered,
+            named,
+        } = self.bucket_counts(cx);
+        let tab = |id: SharedString, label: String, n: Option<usize>, selected: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py(px(2.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .when(selected, |t| {
+                    t.bg(theme::surface0()).text_color(theme::blue())
+                })
+                .when(!selected, |t| {
+                    t.text_color(theme::overlay0())
+                        .hover(|s| s.text_color(theme::text()))
+                })
+                .child(SharedString::from(label))
+                .when_some(n, |t, n| {
+                    t.child(
+                        div()
+                            .text_color(theme::overlay0())
+                            .child(SharedString::from(n.to_string())),
+                    )
+                })
+        };
+        let mut row = div()
+            .px_2()
+            .pb_1()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .text_size(px(16.))
+            .child(
+                tab(
+                    "bucket-all".into(),
+                    "All".into(),
+                    Some(all),
+                    self.selected == Selected::All,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.select_bucket(Selected::All, cx))),
+            )
+            .child(
+                tab(
+                    "bucket-default".into(),
+                    "Default".into(),
+                    Some(default),
+                    self.selected == Selected::Default,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.select_bucket(Selected::Default, cx))),
+            );
+        for (i, name) in self.buckets.names.iter().enumerate() {
+            let selected = self.selected == Selected::Named(name.clone());
+            let pick = name.clone();
+            let mut t = tab(
+                format!("bucket-{i}").into(),
+                name.clone(),
+                Some(named[i]),
+                selected,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_bucket(Selected::Named(pick.clone()), cx)
+            }));
+            if selected {
+                let name = name.clone();
+                t = t.child(
+                    div()
+                        .id(("bucket-delete", i))
+                        .text_color(theme::overlay0())
+                        .hover(|s| s.text_color(theme::red()))
+                        .child("×")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.delete_bucket(&name, cx)
+                        })),
+                );
+            }
+            row = row.child(t);
+        }
+        row.child(
+            tab(
+                "bucket-filtered".into(),
+                "Filtered out".into(),
+                Some(filtered),
+                self.selected == Selected::Filtered,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.select_bucket(Selected::Filtered, cx))),
+        )
+        .child(
+            tab("bucket-new".into(), "+".into(), None, false)
+                .on_click(cx.listener(|this, _, window, cx| this.start_new_bucket(window, cx))),
+        )
+        .when(self.creating_bucket && self.moving.is_none(), |row| {
+            row.child(div().w_full().child(Input::new(&self.bucket_input)))
+        })
     }
 
     fn copy_review(&mut self, cx: &mut Context<Self>) {
@@ -2596,9 +3081,7 @@ impl ReviewApp {
         if !self.exclude.contains(&pattern) {
             self.exclude.push(pattern);
         }
-        if self.effective_exclude(cx) != self.applied_exclude {
-            self.refresh(cx);
-        }
+        self.apply_filters(cx);
     }
 
     /// Pinned excludes plus whatever is typed in the exclude box, so a
@@ -2617,18 +3100,23 @@ impl ReviewApp {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(300))
                 .await;
-            this.update(cx, |this, cx| {
-                if this.effective_exclude(cx) != this.applied_exclude {
-                    this.refresh(cx);
-                }
-            })
-            .ok();
+            this.update(cx, |this, cx| this.apply_filters(cx)).ok();
         }));
     }
 
     fn remove_exclude(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.exclude.remove(ix);
-        self.refresh(cx);
+        self.apply_filters(cx);
+    }
+
+    /// Re-sorts files into or out of Filtered out after the patterns changed.
+    fn apply_filters(&mut self, cx: &mut Context<Self>) {
+        let filters = self.effective_exclude(cx);
+        if filters != self.applied_exclude {
+            self.applied_exclude = filters;
+            self.apply_viewed(cx);
+            cx.notify();
+        }
     }
 
     fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2769,8 +3257,11 @@ impl ReviewApp {
     fn apply_viewed(&mut self, cx: &mut Context<Self>) {
         let query = self.tree_filter_input.read(cx).value().to_string();
         let viewed = self.viewed.clone();
-        if let Some(data) = self.active_data_mut() {
-            data.hidden = viewed_files(&data.diff, &viewed);
+        let filters = self.effective_exclude(cx);
+        let (buckets, selected) = (&self.buckets, &self.selected);
+        if let LoadState::Ready(data) = &mut self.state {
+            (data.hidden, data.viewed_count) =
+                hidden_files(&data.diff, &viewed, buckets, &filters, selected);
             data.set_rows(build_rows(
                 &data.diff,
                 data.mode,
@@ -2807,6 +3298,12 @@ impl ReviewApp {
             return;
         };
         self.viewed.extend(entries);
+        self.hide_and_move_on(last, cx);
+    }
+
+    /// After files up to `last` were hidden (viewed, or moved out of the
+    /// shown bucket): rebuild, and continue at the next shown file.
+    fn hide_and_move_on(&mut self, last: usize, cx: &mut Context<Self>) {
         self.apply_viewed(cx);
         let rows = self.tree_list_rows(cx);
         self.tree_cursor = self.tree_cursor.min(rows.len().saturating_sub(1));
@@ -3055,20 +3552,27 @@ impl ReviewApp {
                     // Escape in the sidebar hands focus back to the diff; the
                     // filter stays applied (it also filters the diff pane).
                     .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                        this.creating_bucket = false;
                         window.focus(&this.focus_handle);
                         cx.notify();
                     }))
                     .child(div().p_2().child(Input::new(&self.tree_filter_input)))
-                    .when(!self.exclude.is_empty(), |col| {
-                        col.child(div().px_2().pb_1().flex().flex_wrap().gap_1().children(
-                            self.exclude.iter().cloned().enumerate().map(|(ix, pat)| {
-                                render_exclude_tag(ix, SharedString::from(pat), &entity)
-                            }),
-                        ))
+                    .child(self.render_bucket_tabs(cx))
+                    .when(
+                        self.selected == buckets::Selected::Filtered && !self.exclude.is_empty(),
+                        |col| {
+                            col.child(div().px_2().pb_1().flex().flex_wrap().gap_1().children(
+                                self.exclude.iter().cloned().enumerate().map(|(ix, pat)| {
+                                    render_exclude_tag(ix, SharedString::from(pat), &entity)
+                                }),
+                            ))
+                        },
+                    )
+                    .when(self.selected == buckets::Selected::Filtered, |col| {
+                        col.child(div().px_2().pb_1().child(Input::new(&self.exclude_input)))
                     })
-                    .child(div().px_2().pb_1().child(Input::new(&self.exclude_input)))
                     .when(!self.viewed.is_empty(), |col| {
-                        let n = self.active_data().map_or(0, |data| data.hidden.len());
+                        let n = self.active_data().map_or(0, |data| data.viewed_count);
                         col.child(
                             div()
                                 .id("viewed-clear")
@@ -3121,20 +3625,6 @@ impl ReviewApp {
                                 ),
                         )
                     })
-                    .when(self.excluded_count > 0, |col| {
-                        let n = self.excluded_count;
-                        col.child(
-                            div()
-                                .px_2()
-                                .pb_1()
-                                .text_size(px(16.))
-                                .text_color(theme::overlay0())
-                                .child(SharedString::from(format!(
-                                    "{n} file{} excluded",
-                                    if n == 1 { "" } else { "s" }
-                                ))),
-                        )
-                    })
                     .child(
                         div()
                             .flex_1()
@@ -3169,6 +3659,13 @@ impl ReviewApp {
     /// Message box and commit button pinned under the file tree.
     fn render_commit_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let empty = self.commit_input.read(cx).value().trim().is_empty();
+        let n = self.bucket_commit_files(cx).len();
+        let bucket = match &self.selected {
+            buckets::Selected::All => "all".to_string(),
+            buckets::Selected::Default => "Default".to_string(),
+            buckets::Selected::Filtered => "filtered out".to_string(),
+            buckets::Selected::Named(name) => name.clone(),
+        };
         div()
             .flex_shrink_0()
             .flex()
@@ -3187,12 +3684,12 @@ impl ReviewApp {
                     .primary()
                     .w_full()
                     .label(if self.committing {
-                        "committing…"
+                        "committing…".to_string()
                     } else {
-                        "Commit all"
+                        format!("Commit {bucket} ({n})")
                     })
                     .loading(self.committing)
-                    .disabled(empty || self.committing || self.active_data().is_none())
+                    .disabled(empty || self.committing || n == 0)
                     .on_click(cx.listener(|this, _, window, cx| this.commit(window, cx))),
             )
             .when_some(self.commit_status.clone(), |col, status| {
@@ -3252,6 +3749,7 @@ impl ReviewApp {
             ("enter", "comment on hunk / selected lines"),
             ("c", "copy review report"),
             ("x", "clear review report"),
+            ("m", "move file / folder to a bucket"),
             ("ctrl-k", "keybindings"),
             ("ctrl-q", "quit"),
         ];
@@ -3599,6 +4097,11 @@ impl Render for ReviewApp {
             )
             .on_action(cx.listener(|this, _: &CopyReview, _, cx| this.copy_review(cx)))
             .on_action(cx.listener(|this, _: &ClearReview, _, cx| this.clear_review(cx)))
+            .on_action(
+                cx.listener(|this, _: &MoveToBucket, window, cx| {
+                    this.open_bucket_picker(window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &ScrollLeft, window, cx| {
                 this.scroll_x_by_key(false, window, cx)
             }))
@@ -3653,6 +4156,7 @@ impl Render for ReviewApp {
             .when(self.keybindings_visible, |root| {
                 root.child(self.render_keybindings(cx))
             })
+            .children(self.render_bucket_picker(cx))
     }
 }
 
@@ -3702,6 +4206,8 @@ fn main() {
                 KeyBinding::new("enter", EditComment, Some("ReviewApp")),
                 KeyBinding::new("c", CopyReview, Some("ReviewApp")),
                 KeyBinding::new("x", ClearReview, Some("ReviewApp")),
+                KeyBinding::new("m", MoveToBucket, Some("ReviewApp")),
+                KeyBinding::new("m", MoveToBucket, Some("FileTree")),
                 KeyBinding::new("ctrl-=", ZoomIn, None),
                 KeyBinding::new("ctrl-+", ZoomIn, None),
                 KeyBinding::new("ctrl--", ZoomOut, None),
@@ -3787,6 +4293,8 @@ mod tests {
             tree_scroll: UniformListScrollHandle::new(),
             tree_last_file: None,
             hidden,
+            viewed_count: 0,
+            states: HashMap::new(),
         }
     }
 
@@ -3811,6 +4319,33 @@ mod tests {
             from_file: 0,
         };
         assert_eq!(data.resolve_anchor(&gone), None);
+    }
+
+    #[test]
+    fn hidden_files_follow_the_selected_bucket() {
+        use buckets::{Buckets, Selected};
+        let data = item_with_hidden(&[]);
+        let mut b = Buckets::default();
+        b.create("one");
+        b.assign(["z/w.txt"], Some("one"));
+        let viewed = HashMap::from([("a/x.txt".to_string(), file_hash(&data.diff.files[0]))]);
+        let (hidden, n) = hidden_files(&data.diff, &viewed, &b, &[], &Selected::All);
+        assert_eq!((hidden, n), (HashSet::from([0]), 1));
+        let (hidden, n) =
+            hidden_files(&data.diff, &viewed, &b, &[], &Selected::Named("one".into()));
+        assert_eq!((hidden, n), (HashSet::from([0, 2]), 0));
+        let (hidden, n) = hidden_files(&data.diff, &viewed, &b, &[], &Selected::Default);
+        assert_eq!((hidden, n), (HashSet::from([0, 1]), 1));
+        // A pattern match puts a/x.txt in Filtered out and nowhere else;
+        // viewed still hides it there.
+        let filters = vec!["a/*".to_string()];
+        let none = HashMap::new();
+        let (hidden, _) = hidden_files(&data.diff, &none, &b, &filters, &Selected::Filtered);
+        assert_eq!(hidden, HashSet::from([1, 2]));
+        let (hidden, n) = hidden_files(&data.diff, &viewed, &b, &filters, &Selected::Filtered);
+        assert_eq!((hidden, n), (HashSet::from([0, 1, 2]), 1));
+        let (hidden, n) = hidden_files(&data.diff, &none, &b, &filters, &Selected::All);
+        assert_eq!((hidden, n), (HashSet::from([0]), 0));
     }
 
     /// A hidden file in the middle shares the next file's header row.

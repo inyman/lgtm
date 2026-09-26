@@ -44,10 +44,10 @@ cargo run --release -- /path/to/repo
 - tree-sitter syntax highlighting
 - word-level intra-line diffs
 - resizable sidebar with file tree + fuzzy filter
-- exclude patterns (e.g. `__generated__`, `*.png`) and mark-as-viewed to hide files
+- a Filtered out bucket for noise (e.g. `__generated__`, `*.png`) and mark-as-viewed to hide files
 - live reload as files change, keeping your scroll position
 - review comments on hunks or selected lines, copied as a report to paste back to the agent
-- commit box: stage everything and commit without leaving the app
+- buckets: sort changed files into named groups and commit one group at a time
 - mouse selection + copy
 - colors follow the active [Omarchy](https://omarchy.org) theme when present, else Catppuccin Mocha
 
@@ -71,7 +71,35 @@ this should be like this or that
 Line numbers are the working-tree file's (`path:start-end`); spans covering only
 removed lines are marked as base-version numbering. The review is kept in
 `<git dir>/lgtm/review.json` (plus a `review.md` copy), so it survives restarts
-and never shows up in the diff. Committing clears it.
+and never shows up in the diff. Committing drops the comments on the committed
+files.
+
+## Buckets and committing
+
+Tabs under the file filter show **All**, **Default** (files not sorted yet), your
+own buckets, and **Filtered out**; `+` adds a bucket. `m` moves the current file —
+or the file/folder under the tree cursor — to a bucket.
+
+**Filtered out** holds every file matching its patterns (`__generated__`, `*.wasm`,
+`*.glb`, `*.png` by default; select the tab to add or remove them). A pattern
+match wins over any bucket, and **All** means everything except Filtered out —
+select the tab to review or commit those files on their own. The selected tab filters the tree and the
+diff, and the commit box commits exactly that bucket's files. Buckets are just a
+view: they live in `<git dir>/lgtm/buckets.json`, and nothing is moved or staged.
+
+Committing never gets in the way of an agent working in the repo, or of your own
+staging:
+
+- the commit is built in a private index under `<git dir>/lgtm/`, never in git's
+  staging area; files outside the bucket — staged or not — are left as they are
+- each file must still be exactly what you reviewed; if the agent changed it
+  since, nothing is committed and the view refreshes
+- HEAD only moves if no other commit landed meanwhile
+- afterwards, git's staging area is updated for the committed files only, as
+  `git commit -- <files>` would
+- hooks don't run
+- all reads run with `GIT_OPTIONAL_LOCKS=0`, so viewing never takes git's index
+  lock
 
 ## Keymap
 | Key | Action |
@@ -85,6 +113,7 @@ and never shows up in the diff. Committing clears it.
 | `enter` | comment on hunk / selected lines |
 | `c` | copy review report |
 | `x` | clear review report |
+| `m` | move file / folder to a bucket (`1`–`9` pick, `n` new) |
 | `space` | mark file (or folder, in the tree) viewed — hides it until it changes |
 | `z` | open in Zed at this line (`zeditor`) |
 | `/` or `ctrl-f` | focus file filter |

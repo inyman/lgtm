@@ -3,6 +3,7 @@
 //! + untracked), as one unified patch for diff-core to parse.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -168,9 +169,7 @@ fn push_remote_head(repo_root: &Path, remote: &str, candidates: &mut Vec<String>
 /// caller keeps that file's patch-derived view.
 pub fn file_at_base(src: &LocalSource, path: &str) -> Option<String> {
     let oid = src.base_oid.as_deref()?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&src.repo_root)
+    let output = git_cmd(&src.repo_root)
         .args(["show", &format!("{oid}:{path}")])
         .output()
         .ok()?;
@@ -200,9 +199,7 @@ pub fn diff_patch(src: &LocalSource) -> Result<String> {
         // `--no-index` against /dev/null renders an untracked file as an
         // added-file diff; it exits 1 when the sides differ, which is success
         // here (0 would mean an empty file — also fine, git emits a header).
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&src.repo_root)
+        let output = git_cmd(&src.repo_root)
             .args([
                 "diff",
                 "--no-color",
@@ -225,37 +222,206 @@ pub fn diff_patch(src: &LocalSource) -> Result<String> {
     Ok(patch)
 }
 
-/// Stages every change (tracked and untracked, honoring .gitignore) and
-/// commits it with `message`. Returns git's one-line summary.
-pub fn commit_all(repo_root: &Path, message: &str) -> Result<String> {
+/// What a changed path must hold in a commit for it to be the version that
+/// was reviewed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expected {
+    /// A regular file with this blob id.
+    Blob(String),
+    /// Deleted from the working tree.
+    Deleted,
+    /// Not fingerprinted (symlinks, submodules): committed as found.
+    Unverified,
+}
+
+/// Fingerprints `paths` in the working tree as `git add` would store them,
+/// without writing anything (`hash-object` without `-w`). A path that
+/// changes mid-read is left out, so a commit of it is refused until the next
+/// read.
+pub fn worktree_state(repo_root: &Path, paths: &[String]) -> HashMap<String, Expected> {
     use std::io::Write;
-    git(repo_root, &["add", "-A"])?;
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["commit", "--quiet", "-F", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| anyhow!("failed to run git: {err}"))?;
-    child
-        .stdin
-        .take()
-        .context("git commit stdin")?
-        .write_all(message.as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let msg = if stderr.trim().is_empty() {
-            stdout
-        } else {
-            stderr
-        };
-        bail!("git commit failed: {}", msg.trim());
+    use std::process::Stdio;
+    let mut out = HashMap::new();
+    let mut files = Vec::new();
+    for path in paths {
+        match std::fs::symlink_metadata(repo_root.join(path)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                out.insert(path.clone(), Expected::Deleted);
+            }
+            Ok(meta) if meta.is_file() => files.push(path.clone()),
+            _ => {
+                out.insert(path.clone(), Expected::Unverified);
+            }
+        }
     }
-    git(repo_root, &["log", "-1", "--format=%h %s"]).map(|s| s.trim().to_string())
+    if files.is_empty() {
+        return out;
+    }
+    let child = git_cmd(repo_root)
+        .args(["hash-object", "--stdin-paths"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return out;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        for path in &files {
+            let _ = writeln!(stdin, "{path}");
+        }
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return out;
+    };
+    let oids: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .unwrap_or_default()
+        .lines()
+        .collect();
+    if output.status.success() && oids.len() == files.len() {
+        for (path, oid) in files.into_iter().zip(oids) {
+            out.insert(path, Expected::Blob(oid.to_string()));
+        }
+    }
+    out
+}
+
+#[derive(Debug)]
+pub struct Committed {
+    /// `<short hash> <subject>`.
+    pub summary: String,
+    /// Set when the commit landed but git's staging area couldn't be
+    /// brought up to date for its files.
+    pub warning: Option<String>,
+}
+
+/// Commits exactly `files` (each at its reviewed state) on top of HEAD,
+/// without touching anything else: the commit is built in a private index
+/// under `.git/lgtm/`, checked against `files`, and HEAD only moves if no
+/// other commit landed meanwhile. Afterwards the real staging area is reset
+/// for these paths only, as `git commit -- <paths>` would. Hooks don't run.
+pub fn commit_files(
+    repo_root: &Path,
+    files: &[(String, Expected)],
+    message: &str,
+) -> Result<Committed> {
+    if files.is_empty() {
+        bail!("nothing to commit");
+    }
+    let dir = state_dir(repo_root).context("couldn't locate the git directory")?;
+    std::fs::create_dir_all(&dir)?;
+    let index = dir.join("commit-index");
+    let _ = std::fs::remove_file(&index);
+    let result = build_commit(repo_root, &index, files, message);
+    let _ = std::fs::remove_file(&index);
+    let (commit, parent) = result?;
+
+    // Move HEAD (its branch) only if it still points where we started.
+    let old = parent.as_deref().unwrap_or("");
+    let subject = message.lines().next().unwrap_or_default();
+    git(
+        repo_root,
+        &[
+            "update-ref",
+            "-m",
+            &format!("commit: {subject}"),
+            "HEAD",
+            &commit,
+            old,
+        ],
+    )
+    .map_err(|_| {
+        anyhow!("another commit landed while committing; nothing was committed, try again")
+    })?;
+
+    let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+    let mut warning = None;
+    for attempt in 0..5 {
+        let mut args = vec!["reset", "-q", "HEAD", "--"];
+        args.extend(&paths);
+        match git_literal(repo_root, None, &args) {
+            Ok(_) => {
+                warning = None;
+                break;
+            }
+            Err(err) => {
+                warning = Some(format!(
+                    "committed, but git's staging area is busy; run `git reset -q -- <files>` \
+                     ({err:#})"
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(100 * (attempt + 1)));
+            }
+        }
+    }
+    let summary = git(repo_root, &["log", "-1", "--format=%h %s", &commit])?
+        .trim()
+        .to_string();
+    Ok(Committed { summary, warning })
+}
+
+/// Builds the commit object in the private `index`; returns it and its
+/// parent (None on an unborn branch).
+fn build_commit(
+    repo_root: &Path,
+    index: &Path,
+    files: &[(String, Expected)],
+    message: &str,
+) -> Result<(String, Option<String>)> {
+    let parent = git(repo_root, &["rev-parse", "--verify", "-q", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string());
+    match &parent {
+        Some(head) => git_literal(repo_root, Some(index), &["read-tree", head])?,
+        None => git_literal(repo_root, Some(index), &["read-tree", "--empty"])?,
+    };
+    let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+    let mut add = vec!["add", "-A", "--"];
+    add.extend(&paths);
+    git_literal(repo_root, Some(index), &add)
+        .map_err(|err| anyhow!("files changed since review; refresh and retry ({err:#})"))?;
+
+    // What went in must be what was reviewed.
+    let mut ls = vec!["ls-files", "-s", "-z", "--"];
+    ls.extend(&paths);
+    let listed = git_literal(repo_root, Some(index), &ls)?;
+    let staged: HashMap<&str, &str> = listed
+        .split('\0')
+        .filter_map(|entry| {
+            let (meta, path) = entry.split_once('\t')?;
+            Some((path, meta.split(' ').nth(1)?))
+        })
+        .collect();
+    let changed: Vec<&str> = files
+        .iter()
+        .filter(|(path, expected)| match expected {
+            Expected::Blob(oid) => staged.get(path.as_str()) != Some(&oid.as_str()),
+            Expected::Deleted => staged.contains_key(path.as_str()),
+            Expected::Unverified => false,
+        })
+        .map(|(path, _)| path.as_str())
+        .collect();
+    if !changed.is_empty() {
+        bail!(
+            "changed since review, nothing was committed: {}",
+            changed.join(", ")
+        );
+    }
+
+    let tree = git_literal(repo_root, Some(index), &["write-tree"])?
+        .trim()
+        .to_string();
+    let mut args = vec!["commit-tree", tree.as_str()];
+    if let Some(head) = &parent {
+        args.extend(["-p", head.as_str()]);
+    }
+    let commit = git_stdin(repo_root, &args, message)?.trim().to_string();
+    Ok((commit, parent))
+}
+
+/// `.git/lgtm` (per worktree): lgtm's own state, never part of the diff.
+pub fn state_dir(repo_root: &Path) -> Option<PathBuf> {
+    let dir = git(repo_root, &["rev-parse", "--absolute-git-dir"]).ok()?;
+    Some(Path::new(dir.trim()).join("lgtm"))
 }
 
 /// Whether any of `paths` (inside `repo_root`) is not gitignored — i.e. a
@@ -266,9 +432,7 @@ pub fn any_unignored(repo_root: &Path, paths: &[PathBuf]) -> bool {
     if paths.is_empty() {
         return false;
     }
-    let child = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let child = git_cmd(repo_root)
         .args(["check-ignore", "--stdin", "-z"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -300,13 +464,55 @@ pub fn any_unignored(repo_root: &Path, paths: &[PathBuf]) -> bool {
     }
 }
 
+/// A git command in `dir` that never takes optional locks: reads don't
+/// refresh the index behind a concurrently running agent's back.
+fn git_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).env("GIT_OPTIONAL_LOCKS", "0");
+    cmd
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    run(git_cmd(dir).args(args), args)
+}
+
+/// `git` with pathspecs taken literally, optionally against a private index.
+fn git_literal(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
+    let mut cmd = git_cmd(dir);
+    cmd.env("GIT_LITERAL_PATHSPECS", "1");
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    run(cmd.args(args), args)
+}
+
+/// `git` with `input` on stdin.
+fn git_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = git_cmd(dir)
         .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| anyhow!("failed to run git (is git installed?): {err}"))?;
+    child
+        .stdin
+        .take()
+        .context("git stdin")?
+        .write_all(input.as_bytes())?;
+    output_of(child.wait_with_output()?, args)
+}
+
+fn run(cmd: &mut Command, args: &[&str]) -> Result<String> {
+    let output = cmd
         .output()
         .map_err(|err| anyhow!("failed to run git (is git installed?): {err}"))?;
+    output_of(output, args)
+}
+
+fn output_of(output: std::process::Output, args: &[&str]) -> Result<String> {
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
@@ -357,18 +563,98 @@ mod tests {
         run(dir, &["git", "config", "commit.gpgsign", "false"]);
     }
 
+    fn state(dir: &Path, paths: &[&str]) -> Vec<(String, Expected)> {
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let states = worktree_state(dir, &paths);
+        paths
+            .into_iter()
+            .map(|p| {
+                let e = states[&p].clone();
+                (p, e)
+            })
+            .collect()
+    }
+
+    fn out(dir: &Path, args: &[&str]) -> String {
+        git(dir, args).unwrap()
+    }
+
+    /// Committing a bucket leaves everything outside it alone: another
+    /// file's staged change stays staged, unrelated edits stay unstaged.
     #[test]
-    fn commit_all_stages_untracked_and_reports_failure() {
+    fn commit_files_touches_only_its_files() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         init_repo(dir);
-        fs::write(dir.join("a.rs"), "fn main() {}\n").unwrap();
-        let summary = commit_all(dir, "Add main\n\nWith a body.").unwrap();
-        assert!(summary.ends_with(" Add main"), "{summary}");
-        let src = resolve_local(dir).unwrap();
-        assert!(diff_patch(&src).unwrap().is_empty());
-        // Nothing left to commit.
-        assert!(commit_all(dir, "again").is_err());
+        for f in ["a.rs", "b.rs", "c.rs", "gone.rs", "old.rs"] {
+            fs::write(dir.join(f), format!("// {f}\n")).unwrap();
+        }
+        run(dir, &["git", "add", "."]);
+        run(dir, &["git", "commit", "-m", "init"]);
+
+        fs::write(dir.join("a.rs"), "// a v2\n").unwrap(); // bucket
+        fs::write(dir.join("new.rs"), "// new\n").unwrap(); // bucket, untracked
+        fs::remove_file(dir.join("gone.rs")).unwrap(); // bucket, deleted
+        run(dir, &["git", "mv", "old.rs", "moved.rs"]); // bucket, rename
+        fs::write(dir.join("b.rs"), "// b staged\n").unwrap();
+        run(dir, &["git", "add", "b.rs"]); // staged, not in bucket
+        fs::write(dir.join("c.rs"), "// c v2\n").unwrap(); // not in bucket
+
+        let files = state(dir, &["a.rs", "new.rs", "gone.rs", "old.rs", "moved.rs"]);
+        let done = commit_files(dir, &files, "Bucket one\n\nbody").unwrap();
+        assert!(done.summary.ends_with(" Bucket one"), "{}", done.summary);
+        assert!(done.warning.is_none());
+
+        let shown = out(dir, &["show", "--name-status", "--format=", "HEAD"]);
+        let mut lines: Vec<&str> = shown.lines().collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            [
+                "A\tnew.rs",
+                "D\tgone.rs",
+                "M\ta.rs",
+                "R100\told.rs\tmoved.rs"
+            ]
+        );
+        let status = out(dir, &["status", "--porcelain"]);
+        let mut status: Vec<&str> = status.lines().collect();
+        status.sort();
+        assert_eq!(status, [" M c.rs", "M  b.rs"]);
+    }
+
+    #[test]
+    fn commit_files_refuses_what_changed_after_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        fs::write(dir.join("a.rs"), "// a\n").unwrap();
+        run(dir, &["git", "add", "."]);
+        run(dir, &["git", "commit", "-m", "init"]);
+        let head = out(dir, &["rev-parse", "HEAD"]);
+
+        fs::write(dir.join("a.rs"), "// reviewed\n").unwrap();
+        let files = state(dir, &["a.rs"]);
+        fs::write(dir.join("a.rs"), "// agent kept going\n").unwrap();
+        let err = commit_files(dir, &files, "x").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("changed since review"),
+            "{err:#}"
+        );
+        assert_eq!(out(dir, &["rev-parse", "HEAD"]), head);
+        assert_eq!(out(dir, &["status", "--porcelain"]), " M a.rs\n");
+    }
+
+    #[test]
+    fn commit_files_on_unborn_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        fs::write(dir.join("a.rs"), "// a\n").unwrap();
+        fs::write(dir.join("b.rs"), "// b\n").unwrap();
+        commit_files(dir, &state(dir, &["a.rs"]), "first").unwrap();
+        assert_eq!(out(dir, &["ls-files"]), "a.rs\n");
+        assert_eq!(out(dir, &["status", "--porcelain"]), "?? b.rs\n");
     }
 
     #[test]
