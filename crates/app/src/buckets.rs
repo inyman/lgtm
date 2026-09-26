@@ -12,9 +12,10 @@
 //! - the hand ASSIGNMENTS (+ the diff each was sorted at) belong to one
 //!   worktree's changes: `<git dir>/lgtm/bucket-files.json`.
 //!
-//! Both are first seeded from the older per-worktree `buckets.json` (names +
-//! assignments) and `filters.json` (the Filtered out patterns, which become a
-//! `generated` bucket), which are left in place.
+//! A repo starts with no buckets: every pattern comes from what was saved.
+//! Both files are first seeded from the older per-worktree `buckets.json`
+//! (names + assignments) and `filters.json` (the Filtered out patterns, which
+//! become a `generated` bucket), which are left in place.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -30,9 +31,7 @@ pub enum Selected {
     Viewed,
 }
 
-/// The patterns a repo's first bucket, `generated`, starts with.
-pub const DEFAULT_PATTERNS: &[&str] = &["__generated__", "*.wasm", "*.glb", "*.png"];
-/// The bucket the default patterns (or an older `filters.json`'s) seed.
+/// The bucket an older `filters.json`'s patterns seed.
 const SEEDED_BUCKET: &str = "generated";
 /// Names the sidebar's own entries use.
 const RESERVED: &[&str] = &["unsorted", "viewed", "all", "default"];
@@ -108,7 +107,7 @@ impl Buckets {
         let defs = read_json::<Vec<Bucket>>(&defs_file).unwrap_or_else(|| {
             let patterns =
                 read_json::<Vec<String>>(&local.as_ref().map(|dir| dir.join("filters.json")))
-                    .unwrap_or_else(|| DEFAULT_PATTERNS.iter().map(|s| s.to_string()).collect());
+                    .unwrap_or_default();
             let mut defs: Vec<Bucket> = legacy
                 .names
                 .iter()
@@ -117,7 +116,7 @@ impl Buckets {
                     patterns: Vec::new(),
                 })
                 .collect();
-            if !defs.iter().any(|def| def.name == SEEDED_BUCKET) {
+            if !patterns.is_empty() && !defs.iter().any(|def| def.name == SEEDED_BUCKET) {
                 defs.push(Bucket {
                     name: SEEDED_BUCKET.to_string(),
                     patterns,

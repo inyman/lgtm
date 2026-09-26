@@ -44,10 +44,10 @@ cargo run --release -- /path/to/repo
 - tree-sitter syntax highlighting
 - word-level intra-line diffs
 - resizable sidebar with file tree + fuzzy filter
-- a Filtered out bucket for noise (e.g. `__generated__`, `*.png`) and mark-as-viewed to hide files
 - live reload as files change, keeping your scroll position
 - review comments on hunks or selected lines, copied as a report to paste back to the agent
-- buckets: sort changed files into named groups and commit one group at a time
+- buckets: path patterns (`docs/context`, `*.glb`, `__generated__`) sort changed files into
+  named groups you commit one group at a time; mark-as-viewed moves a file out of the way
 - `z` opens the file in [Zed](https://zed.dev) at the line you're on
 - mouse selection + copy
 - colors follow the active [Omarchy](https://omarchy.org) theme when present, else Catppuccin Mocha
@@ -77,17 +77,31 @@ files.
 
 ## Buckets and committing
 
-Tabs under the file filter show **All**, **Default** (files not sorted yet), your
-own buckets, and **Filtered out**; `+` adds a bucket. A **●** marks a bucketed file
-(and its tab) that changed since you sorted it; marking it viewed clears it. `m` moves the current file —
-or the file/folder under the tree cursor — to a bucket.
+Tabs under the file filter show **Unsorted** (files no bucket claims), your
+buckets, and **Viewed**; `+` adds a bucket. The selected tab filters the tree and
+the diff, and the commit box commits exactly that tab's files.
 
-**Filtered out** holds every file matching its patterns (`__generated__`, `*.wasm`,
-`*.glb`, `*.png` by default; select the tab to add or remove them). A pattern
-match wins over any bucket, and **All** means everything except Filtered out —
-select the tab to review or commit those files on their own. The selected tab filters the tree and the
-diff, and the commit box commits exactly that bucket's files. Buckets are just a
-view: they live in `<git dir>/lgtm/buckets.json`, and nothing is moved or staged.
+A bucket claims files two ways:
+
+- **path patterns** — select the bucket, type a pattern under the tabs, `enter`
+  pins it (it applies while you type). A pattern matches any run of whole path
+  segments: `docs/context` takes everything under that folder, `*.glb` matches by
+  file name, `__generated__` any folder of that name. Each pattern shows as a tag
+  with a `×` to remove it.
+- **by hand** — `m` moves the current file, or the file/folder under the tree
+  cursor, into a bucket.
+
+Every file sits in exactly one place: its hand assignment, else the first bucket
+(left to right) whose pattern matches, else Unsorted. A **●** marks a hand-sorted
+file (and its tab) that changed since you sorted it; marking it viewed clears it.
+
+`space` marks a file viewed: it leaves its bucket for **Viewed** until its diff
+changes. In Viewed, `space` sends it back, and Commit commits the viewed files.
+
+Buckets are just a view — nothing is moved or staged — and a repo starts with
+none. Their names, order and patterns live in `<common git dir>/lgtm/bucket-defs.json`,
+shared by every worktree of the repo; hand assignments are per worktree, in
+`<git dir>/lgtm/bucket-files.json`.
 
 Committing never gets in the way of an agent working in the repo, or of your own
 staging:
@@ -133,10 +147,11 @@ Zed's CLI is `zed`, which lgtm doesn't call yet).
 | `c` | copy review report (selected bucket's files) |
 | `x` | clear review report (selected bucket's files) |
 | `m` | move file / folder to a bucket (`1`–`9` pick, `n` new) |
-| `space` | mark file (or folder, in the tree) viewed — hides it until it changes |
+| `space` | mark file (or folder, in the tree) viewed — it moves to Viewed until it changes; in Viewed, back to its bucket |
 | `z` | open in Zed at this line (`zeditor`) |
 | `/` or `ctrl-f` | focus file filter |
-| `esc` | clear selection / switch between diff and file tree |
+| `tab` | diff ⇄ file tree |
+| `esc` | back to the diff from anywhere; in the diff, clear the selection / line cursor |
 | `r` | refresh |
 | `ctrl-b` | toggle sidebar |
 | `ctrl-+` / `ctrl--` / `ctrl-0` | diff font size: bigger / smaller / reset |

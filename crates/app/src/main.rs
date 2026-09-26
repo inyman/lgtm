@@ -73,6 +73,7 @@ actions!(
         TreeCollapse,
         TreeExpand,
         FocusDiff,
+        FocusFileTree,
         MarkViewed,
         OpenInEditor,
         GoToTop,
@@ -994,8 +995,18 @@ fn render_tree_row(
             )
     };
     let entity = entity.clone();
+    // Pressing a row focuses the file tree before the click lands: move the
+    // tree's cursor here first, or the old cursor row (the top one) lights
+    // up for that moment.
+    let press = {
+        let entity = entity.clone();
+        move |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+            entity.update(cx, |this, _| this.tree_cursor = pos);
+        }
+    };
     let base = div()
         .id(("tree-row", pos))
+        .on_mouse_down(MouseButton::Left, press)
         .h(px(TREE_ROW_HEIGHT))
         .w_full()
         .flex()
@@ -3815,8 +3826,15 @@ impl ReviewApp {
             ("v", "unified / split"),
             ("/", "filter files"),
             ("ctrl-f", "filter files"),
-            ("escape", "switch file tree / diff"),
-            ("space", "mark file / folder viewed (hide it)"),
+            ("tab", "diff ⇄ file list"),
+            (
+                "escape",
+                "back to the diff (in the diff: clear the selection / line mode)",
+            ),
+            (
+                "space",
+                "mark file / folder viewed (it moves to Viewed; there: back to its bucket)",
+            ),
             ("z", "open in Zed at this line"),
             ("home", "top"),
             ("end", "bottom"),
@@ -4172,8 +4190,12 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             // Escape in the diff: close the keybindings panel, else clear the
-            // selection, else move focus to the sidebar's file tree.
-            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
+            // selection, else leave line mode. It never leaves the diff — tab
+            // goes to the file list.
+            .on_action(
+                cx.listener(|this, _: &FocusFileTree, window, cx| this.focus_tree(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
                 if this.keybindings_visible {
                     this.keybindings_visible = false;
                     cx.notify();
@@ -4187,10 +4209,8 @@ impl Render for ReviewApp {
                     if data.line_mode {
                         data.line_mode = false;
                         cx.notify();
-                        return;
                     }
                 }
-                this.focus_tree(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
                 let Some(data) = this.active_data() else {
@@ -4311,6 +4331,8 @@ fn main() {
                 KeyBinding::new("right", ScrollRight, Some("ReviewApp")),
                 KeyBinding::new("right", TreeExpand, Some("FileTree")),
                 KeyBinding::new("escape", FocusDiff, Some("FileTree")),
+                KeyBinding::new("tab", FocusDiff, Some("FileTree")),
+                KeyBinding::new("tab", FocusFileTree, Some("ReviewApp")),
                 KeyBinding::new("space", MarkViewed, Some("FileTree")),
                 KeyBinding::new("space", MarkViewed, Some("ReviewApp")),
                 KeyBinding::new("z", OpenInEditor, Some("ReviewApp")),
