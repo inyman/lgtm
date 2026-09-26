@@ -424,6 +424,17 @@ pub fn state_dir(repo_root: &Path) -> Option<PathBuf> {
     Some(Path::new(dir.trim()).join("lgtm"))
 }
 
+/// `<common git dir>/lgtm`: state every worktree of the repo shares (the
+/// main checkout's `.git/lgtm`), e.g. bucket definitions.
+pub fn shared_state_dir(repo_root: &Path) -> Option<PathBuf> {
+    let dir = git(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    Some(Path::new(dir.trim()).join("lgtm"))
+}
+
 /// Whether any of `paths` (inside `repo_root`) is not gitignored — i.e. a
 /// change there could show up in the diff. Errs toward `true` if git fails.
 pub fn any_unignored(repo_root: &Path, paths: &[PathBuf]) -> bool {
