@@ -48,6 +48,7 @@ cargo run --release -- /path/to/repo
 - live reload as files change, keeping your scroll position
 - review comments on hunks or selected lines, copied as a report to paste back to the agent
 - buckets: sort changed files into named groups and commit one group at a time
+- `z` opens the file in [Zed](https://zed.dev) at the line you're on
 - mouse selection + copy
 - colors follow the active [Omarchy](https://omarchy.org) theme when present, else Catppuccin Mocha
 
@@ -100,6 +101,22 @@ staging:
 - hooks don't run
 - all reads run with `GIT_OPTIONAL_LOCKS=0`, so viewing never takes git's index
   lock
+
+## Zed
+
+`z` hands the spot you're looking at to [Zed](https://zed.dev), so you can go
+from reviewing to editing in one key:
+
+- on a line (`shift-down` / `shift-up`, or a click) it opens that line
+- on a mouse selection it opens at the selection, column included
+- on a hunk it opens the hunk's first line; in the file tree, the file's first
+  hunk
+- a removed line no longer exists in the file, so it opens the nearest line
+  that does
+
+It runs `zeditor <file>:<line>[:<col>]`, which opens the file in the running
+Zed. That's the CLI's name on Linux; make sure it's on your `PATH` (on macOS
+Zed's CLI is `zed`, which lgtm doesn't call yet).
 
 ## Keymap
 | Key | Action |
