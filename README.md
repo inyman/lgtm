@@ -53,7 +53,7 @@ cargo run --release -- /path/to/repo
 
 ## Reviewing
 
-Press `enter` on a hunk (or on a mouse selection) to comment on it; `esc` saves,
+Press `enter` on a hunk, a line (`shift-down` / `shift-up`) or a mouse selection to comment on it; `esc` saves,
 an empty comment deletes. Commented hunks show the note in their `@@` header.
 `c` copies the review:
 
@@ -107,6 +107,7 @@ staging:
 | `]` / `[` | next / previous file |
 | `n` / `p` | next / previous hunk |
 | `down` / `up` | scroll through the hunk, then next / previous hunk |
+| `shift-down` / `shift-up` | next / previous changed line (line cursor for `z` and `enter`; a click sets it too) |
 | `left` / `right` | scroll sideways |
 | `home` / `end` | top / bottom |
 | `v` | unified ↔ split view |

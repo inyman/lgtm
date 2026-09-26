@@ -91,6 +91,8 @@ actions!(
         EditComment,
         ClearReview,
         MoveToBucket,
+        LineDown,
+        LineUp,
         ScrollLeft,
         ScrollRight,
         CopyReview,
@@ -1288,6 +1290,18 @@ fn diff_lines(rows: &[Row]) -> Vec<DiffLine> {
     out
 }
 
+/// Whether a row shows an added or removed line (either side, in split).
+fn is_changed_line(row: &Row) -> bool {
+    match row {
+        Row::Line { kind, .. } => *kind != LineKind::Context,
+        Row::SplitLine { left, right } => [left, right]
+            .into_iter()
+            .flatten()
+            .any(|cell| cell.kind != LineKind::Context),
+        _ => false,
+    }
+}
+
 fn row_lines(row: &Row) -> Option<(Option<u32>, Option<u32>)> {
     match row {
         Row::Line { old_no, new_no, .. } => Some((*old_no, *new_no)),
@@ -1309,6 +1323,9 @@ struct ItemData {
     widest_row_ix: usize,
     split_scroll_x: f32,
     cursor: usize,
+    /// The cursor is on a single line (shift+arrows, or a click) rather
+    /// than a hunk: it's highlighted, and `z` / Enter act on that line.
+    line_mode: bool,
     scroll: UniformListScrollHandle,
     additions: u32,
     deletions: u32,
@@ -2068,6 +2085,7 @@ impl ReviewApp {
                     widest_row_ix,
                     split_scroll_x: 0.,
                     cursor: 0,
+                    line_mode: false,
                     scroll: UniformListScrollHandle::new(),
                     additions,
                     deletions,
@@ -2100,6 +2118,7 @@ impl ReviewApp {
                 };
                 data.comment_target(from.row..to.row + 1, side, false)
             }
+            None if data.line_mode => data.comment_target(data.cursor..data.cursor + 1, None, true),
             None => data
                 .current_hunk()
                 .and_then(|(_, start, end)| data.comment_target(start..end, None, true)),
@@ -2956,6 +2975,7 @@ impl ReviewApp {
     fn jump(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(data) = self.active_data_mut() {
             data.cursor = ix;
+            data.line_mode = false;
             let rh = row_height();
             let handle = data.scroll.0.borrow().base_handle.clone();
             let viewport = f32::from(handle.bounds().size.height);
@@ -2977,9 +2997,11 @@ impl ReviewApp {
     /// overlap) until its end is visible; only then move to the next or
     /// previous hunk.
     fn step_hunk(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(data) = self.active_data() else {
+        let Some(data) = self.active_data_mut() else {
             return;
         };
+        data.line_mode = false;
+        let data = &*data;
         if let Some((_, start, end)) = data.current_hunk() {
             let rh = row_height();
             let handle = data.scroll.0.borrow().base_handle.clone();
@@ -3008,6 +3030,50 @@ impl ReviewApp {
         } else {
             self.jump_prev(&targets, cx)
         }
+    }
+
+    /// Shift+arrows: step the cursor to the next / previous changed line,
+    /// across hunks and files, keeping it on screen.
+    fn step_line(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        let from = data.cursor;
+        let target = if forward {
+            (from + 1..data.rows.len()).find(|&ix| is_changed_line(&data.rows[ix]))
+        } else {
+            (0..from.min(data.rows.len()))
+                .rev()
+                .find(|&ix| is_changed_line(&data.rows[ix]))
+        };
+        // The first press lands on the line the cursor is already on.
+        let target = match target {
+            _ if !data.line_mode && data.rows.get(from).is_some_and(is_changed_line) => from,
+            Some(ix) => ix,
+            None => return,
+        };
+        data.cursor = target;
+        data.line_mode = true;
+        data.selection = None;
+        let rh = row_height();
+        let handle = data.scroll.0.borrow().base_handle.clone();
+        let viewport = f32::from(handle.bounds().size.height);
+        let top = -f32::from(handle.offset().y);
+        let margin = 3. * rh;
+        let (y0, y1) = (target as f32 * rh, (target + 1) as f32 * rh);
+        let new_top = if viewport <= 0. {
+            None
+        } else if y0 < top + margin {
+            Some((y0 - margin).max(0.))
+        } else if y1 > top + viewport - margin {
+            Some(y1 - viewport + margin)
+        } else {
+            None
+        };
+        if let Some(new_top) = new_top {
+            handle.set_offset(point(handle.offset().x, px(-new_top)));
+        }
+        cx.notify();
     }
 
     fn jump_next(&mut self, targets: &[usize], cx: &mut Context<Self>) {
@@ -3731,6 +3797,7 @@ impl ReviewApp {
             ("p", "previous hunk"),
             ("down", "scroll hunk / next hunk"),
             ("up", "scroll hunk / previous hunk"),
+            ("shift-down / shift-up", "next / previous changed line"),
             ("left / right", "scroll sideways"),
             ("v", "unified / split"),
             ("/", "filter files"),
@@ -3856,10 +3923,17 @@ impl Render for ReviewApp {
                             window.focus(&this.focus_handle);
                             let char_width = this.char_width(window);
                             this.drag_anchor = this.pane_hit(event.position, char_width, None);
+                            let row = this.drag_anchor.map(|(_, at)| at.row);
                             if let Some(data) = this.active_data_mut() {
-                                if data.selection.take().is_some() {
-                                    cx.notify();
+                                data.selection = None;
+                                // Clicking a line puts the line cursor there.
+                                if let Some(row) =
+                                    row.filter(|&r| data.rows.get(r).and_then(row_lines).is_some())
+                                {
+                                    data.cursor = row;
+                                    data.line_mode = true;
                                 }
+                                cx.notify();
                             }
                         }),
                     )
@@ -3950,6 +4024,24 @@ impl Render for ReviewApp {
                                                     render_hunk_header(label, note)
                                                 }
                                                 _ => render_row(row, row_sel, split_x),
+                                            };
+                                            let line = data.line_mode && ix == data.cursor;
+                                            let el = if line {
+                                                div()
+                                                    .relative()
+                                                    .child(el)
+                                                    .child(
+                                                        div()
+                                                            .absolute()
+                                                            .size_full()
+                                                            .top_0()
+                                                            .left_0()
+                                                            .bg(Hsla::from(theme::blue())
+                                                                .opacity(0.18)),
+                                                    )
+                                                    .into_any_element()
+                                            } else {
+                                                el
                                             };
                                             if hunk.as_ref().is_some_and(|h| h.contains(&ix)) {
                                                 div()
@@ -4055,6 +4147,8 @@ impl Render for ReviewApp {
                 cx.listener(|this, _: &MarkViewed, window, cx| this.mark_viewed(None, window, cx)),
             )
             .on_action(cx.listener(|this, _: &HunkDown, _, cx| this.step_hunk(true, cx)))
+            .on_action(cx.listener(|this, _: &LineDown, _, cx| this.step_line(true, cx)))
+            .on_action(cx.listener(|this, _: &LineUp, _, cx| this.step_line(false, cx)))
             .on_action(cx.listener(|this, _: &HunkUp, _, cx| this.step_hunk(false, cx)))
             .on_action(cx.listener(|this, _: &GoToTop, _, cx| this.jump(0, cx)))
             .on_action(cx.listener(|this, _: &GoToBottom, _, cx| {
@@ -4074,6 +4168,11 @@ impl Render for ReviewApp {
                 }
                 if let Some(data) = this.active_data_mut() {
                     if data.selection.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
+                    if data.line_mode {
+                        data.line_mode = false;
                         cx.notify();
                         return;
                     }
@@ -4183,6 +4282,8 @@ fn main() {
                 KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
                 KeyBinding::new("down", HunkDown, Some("ReviewApp")),
                 KeyBinding::new("up", HunkUp, Some("ReviewApp")),
+                KeyBinding::new("shift-down", LineDown, Some("ReviewApp")),
+                KeyBinding::new("shift-up", LineUp, Some("ReviewApp")),
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
@@ -4284,6 +4385,7 @@ mod tests {
             widest_row_ix,
             split_scroll_x: 0.,
             cursor: 0,
+            line_mode: false,
             scroll: UniformListScrollHandle::new(),
             additions: 0,
             deletions: 0,
