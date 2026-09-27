@@ -1587,6 +1587,64 @@ fn is_relevant_change(root: &Path, path: &Path) -> bool {
     }
 }
 
+/// Arms `watcher` on `root` and every directory under it that can carry a change
+/// to the diff: one non-recursive watch each, added by our own walk, because
+/// `RecursiveMode::Recursive` has no way to skip anything.
+///
+/// WHAT IS SKIPPED IS WHAT GIT IGNORES (`git::ignored_dirs`) — an ignored file
+/// never shows in the diff, and those trees are the expensive ones: playtest's
+/// `node_modules` + `target` are 7,700 of its 13,000 directories, and walking
+/// them cold took 13 s. Inside `.git` only `refs` is watched; `HEAD` is caught by
+/// the watch on `.git` itself and `objects` is the repo's biggest tree.
+///
+/// Best effort per directory: one that vanishes mid-walk, or a watch the kernel
+/// refuses, costs that directory's events, never the whole watcher.
+fn watch_tree(watcher: &mut notify::RecommendedWatcher, root: &Path) -> notify::Result<()> {
+    use notify::Watcher;
+    watcher.watch(root, notify::RecursiveMode::NonRecursive)?;
+    let git = root.join(".git");
+    watcher
+        .watch(&git, notify::RecursiveMode::NonRecursive)
+        .ok();
+    watcher
+        .watch(&git.join("refs"), notify::RecursiveMode::Recursive)
+        .ok();
+    let ignored: HashSet<PathBuf> = git::ignored_dirs(root).into_iter().collect();
+    watch_below(watcher, &ignored, root);
+    Ok(())
+}
+
+/// Watches every directory under `start`, `ignored` and `.git` aside — the walk
+/// `watch_tree` does, also used for a directory that appears LATER: a
+/// non-recursive watch reports a new child folder but does not watch it, and a
+/// whole tree moved in reports only its top.
+fn watch_below(watcher: &mut notify::RecommendedWatcher, ignored: &HashSet<PathBuf>, start: &Path) {
+    use notify::Watcher;
+    let mut pending = vec![start.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue; // gone or unreadable mid-walk
+        };
+        for entry in entries.flatten() {
+            // `file_type` is the dirent's own kind: a symlink is never followed,
+            // so a link into an ignored tree or out of the repo costs nothing.
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_name() == ".git" || ignored.contains(&path) {
+                continue;
+            }
+            if watcher
+                .watch(&path, notify::RecursiveMode::NonRecursive)
+                .is_ok()
+            {
+                pending.push(path);
+            }
+        }
+    }
+}
+
 fn fetch_item(
     path: &Path,
     mode: ViewMode,
@@ -1729,7 +1787,11 @@ struct ReviewApp {
     /// was built with; a refetch that matches is dropped so watcher noise
     /// doesn't reset scroll or selection.
     installed_key: Option<(u64, ViewMode)>,
-    _watcher: Option<notify::RecommendedWatcher>,
+    /// Shared with the drain loop, which arms directories that appear later.
+    _watcher: Option<std::sync::Arc<std::sync::Mutex<notify::RecommendedWatcher>>>,
+    /// The watcher is armed or being armed (arming runs in the background, so
+    /// `_watcher` stays None for a moment and can't answer "already watching").
+    watching: bool,
     focus_handle: FocusHandle,
     /// Keyboard focus for the sidebar file tree, and its cursor (a position
     /// in `tree_list_rows`).
@@ -1878,6 +1940,7 @@ impl ReviewApp {
             pattern_debounce: None,
             installed_key: None,
             _watcher: None,
+            watching: false,
             focus_handle: cx.focus_handle(),
             tree_focus: cx.focus_handle(),
             tree_cursor: 0,
@@ -1968,7 +2031,8 @@ impl ReviewApp {
             mode,
             patch_hash: _,
         } = loaded;
-        if self._watcher.is_none() {
+        if !self.watching {
+            self.watching = true;
             self.review = review::Review::load(&src.repo_root);
             self.watch_repo(src.repo_root.clone(), cx);
         }
@@ -2847,35 +2911,55 @@ impl ReviewApp {
 
     /// Refresh when files in the repo change. Events are drained on a short
     /// tick so a burst of saves (formatters, `git checkout`) is one refetch.
+    ///
+    /// ARMING THE WATCHER NEVER RUNS ON THE UI THREAD: it walks every watched
+    /// directory of the repo, which on a cold cache takes seconds — the window
+    /// froze for 13 s and the compositor offered to kill it. It is armed in the
+    /// background and the events it already queued are read once it lands.
     fn watch_repo(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        use notify::Watcher;
         let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
         let watch_root = root.clone();
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                if matches!(event.kind, notify::EventKind::Access(_)) {
+        let walk_root = root.clone();
+        let arming = cx.background_executor().spawn(async move {
+            let mut watcher =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if let Ok(event) = res {
+                        if matches!(event.kind, notify::EventKind::Access(_)) {
+                            return;
+                        }
+                        for path in event.paths {
+                            if is_relevant_change(&watch_root, &path) {
+                                tx.send(path).ok();
+                            }
+                        }
+                    }
+                })
+                .map_err(|err| format!("{err}"))?;
+            watch_tree(&mut watcher, &walk_root).map_err(|err| format!("{err}"))?;
+            Ok::<notify::RecommendedWatcher, String>(watcher)
+        });
+        cx.spawn(async move |this, cx| {
+            let watcher = match arming.await {
+                Ok(watcher) => {
+                    let shared = std::sync::Arc::new(std::sync::Mutex::new(watcher));
+                    if this
+                        .update(cx, |app, _| app._watcher = Some(shared.clone()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    shared
+                }
+                Err(err) => {
+                    this.update(cx, |app, cx| {
+                        app.refresh_error =
+                            Some(format!("file watching unavailable: {err}").into());
+                        cx.notify();
+                    })
+                    .ok();
                     return;
                 }
-                for path in event.paths {
-                    if is_relevant_change(&watch_root, &path) {
-                        tx.send(path).ok();
-                    }
-                }
-            }
-        });
-        let mut watcher = match watcher {
-            Ok(w) => w,
-            Err(err) => {
-                self.refresh_error = Some(format!("file watching unavailable: {err}").into());
-                return;
-            }
-        };
-        if let Err(err) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
-            self.refresh_error = Some(format!("file watching unavailable: {err}").into());
-            return;
-        }
-        self._watcher = Some(watcher);
-        cx.spawn(async move |this, cx| {
+            };
             let mut dirty = false;
             loop {
                 cx.background_executor()
@@ -2884,6 +2968,36 @@ impl ReviewApp {
                 let mut paths: Vec<PathBuf> = rx.try_iter().collect();
                 paths.sort();
                 paths.dedup();
+                if !paths.is_empty() {
+                    // Each watch is one directory, so a directory that just
+                    // appeared — or a tree moved in — is armed here or its files
+                    // are never seen. In the background: it walks and takes the
+                    // watcher's lock.
+                    let (watcher, root, appeared) = (watcher.clone(), root.clone(), paths.clone());
+                    cx.background_spawn(async move {
+                        let dirs: Vec<PathBuf> =
+                            appeared.into_iter().filter(|path| path.is_dir()).collect();
+                        if dirs.is_empty() {
+                            return;
+                        }
+                        let ignored: HashSet<PathBuf> =
+                            git::ignored_dirs(&root).into_iter().collect();
+                        let Ok(mut watcher) = watcher.lock() else {
+                            return;
+                        };
+                        for dir in dirs {
+                            if ignored.contains(&dir) {
+                                continue;
+                            }
+                            use notify::Watcher as _;
+                            watcher
+                                .watch(&dir, notify::RecursiveMode::NonRecursive)
+                                .ok();
+                            watch_below(&mut watcher, &ignored, &dir);
+                        }
+                    })
+                    .await;
+                }
                 if !paths.is_empty() && !dirty {
                     // Build output (dist/, caches) is usually gitignored and
                     // can't change the diff; `.git` paths are never "ignored".

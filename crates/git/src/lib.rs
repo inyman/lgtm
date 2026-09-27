@@ -475,6 +475,39 @@ pub fn any_unignored(repo_root: &Path, paths: &[PathBuf]) -> bool {
     }
 }
 
+/// The repo's IGNORED directories, absolute — `node_modules`, `target`, `dist`,
+/// whatever its `.gitignore` says. Nothing inside them can change the diff, so a
+/// caller walking the tree skips them whole; `--directory` collapses an ignored
+/// tree into its top directory, so the walk never descends one. Empty when git
+/// fails: watching too much is the safe side.
+pub fn ignored_dirs(repo_root: &Path) -> Vec<PathBuf> {
+    let output = git_cmd(repo_root)
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        // Only the collapsed DIRECTORY entries — git ends those with `/`; an
+        // ignored single file needs no skipping, the walk only skips folders.
+        .filter(|entry| entry.ends_with(b"/"))
+        .map(|entry| {
+            repo_root.join(String::from_utf8_lossy(&entry[..entry.len() - 1]).into_owned())
+        })
+        .collect()
+}
+
 /// A git command in `dir` that never takes optional locks: reads don't
 /// refresh the index behind a concurrently running agent's back.
 fn git_cmd(dir: &Path) -> Command {

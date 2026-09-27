@@ -44,7 +44,9 @@ cargo run --release -- /path/to/repo
 - tree-sitter syntax highlighting
 - word-level intra-line diffs
 - resizable sidebar with file tree + fuzzy filter
-- live reload as files change, keeping your scroll position
+- live reload as files change, keeping your scroll position (git-ignored trees are
+  never watched — a `node_modules` / `target` is thousands of directories the diff
+  can't show, and arming them froze the window for seconds)
 - review comments on hunks or selected lines, copied as a report to paste back to the agent
 - buckets: path patterns (`docs/context`, `*.glb`, `__generated__`) sort changed files into
   named groups you commit one group at a time; mark-as-viewed moves a file out of the way
